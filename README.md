@@ -30,7 +30,7 @@ Each directory typically contains:
 - `CallGraphExtraction.py`
 - `FeatureExtraction.py`
 - `gexfToSequences.py`
-- `拉普拉斯平滑处理.py` (Laplace smoothing / statistics)
+- `Laplace_smoothing.py` (Laplace smoothing / statistics)
 - `sequences_merge.py`
 - `clustering.py`
 - `concat.py`
@@ -113,7 +113,7 @@ Reads `.gexf` / `.gexf.gz` graphs and computes centrality features for nodes tha
 ### 3) gexfToSequences.py — `.gexf` → sensitive API sequences (TXT)
 Converts graph nodes to Java-like method names, contracts to sensitive APIs based on `APSAPI.txt`, and outputs sequences per APK.
 
-### 4) 拉普拉斯平滑处理.py — training statistics (entropy/weights)
+### 4) Laplace_smoothing.py — training statistics (entropy/weights)
 Computes training-set statistics for sensitive API usage (used to compute “maliciousness value” / weights for sequences).
 
 ### 5) sequences_merge.py — merge similar sequences
@@ -168,7 +168,7 @@ python FeatureExtraction.py --help
 python gexfToSequences.py --help
 
 # 4) compute Laplace smoothing / statistics
-python 拉普拉斯平滑处理.py --help
+python Laplace_smoothing.py --help
 
 # 5) merge similar sequences
 python sequences_merge.py --help
@@ -202,7 +202,7 @@ cd MPSDroid/10-fold
 python CallGraphExtraction.py --help
 python FeatureExtraction.py --help
 python gexfToSequences.py --help
-python 拉普拉斯平滑处理.py --help
+python Laplace_smoothing.py --help
 python sequences_merge.py --help
 python clustering.py --help
 python concat.py --help
