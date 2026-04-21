@@ -3,12 +3,10 @@ import os
 import sys
 import subprocess
 import concurrent.futures as cf
-import time  # 新增
-
-# 定义任务（列表形式更安全，避免 shell 展开问题）
+import time
 TASKS = [
 
-    ["python", "拉普拉斯平滑处理.py", "--test-dir", "./Sequences/ResStringEncryption"],
+    ["python", "Laplace_smoothing.py", "--test-dir", "./Sequences/ResStringEncryption"],
     ["python", "sequences_merge.py", "--test-data-root", "./Sequences/ResStringEncryption"],
     ["python", "clustering.py"],
     ["python", "concat.py", "--input", "./statistic/train/file_cluster_distribution.csv",
@@ -36,7 +34,7 @@ TASKS = [
     # ["python", "CV2.py", "-d", "/mnt/data2/wb2024/Methodology/MalScan/APIChecker-mc/merge", "-o", "/mnt/data2/wb2024/Methodology/MalScan/APIChecker-mc/result"]
 ]
 
-MAX_WORKERS = 1  # 并发数；设为 1 即顺序执行
+MAX_WORKERS = 1
 LOG_DIR = "logs"
 
 
@@ -57,7 +55,6 @@ def run_task(idx: int, args: list[str]) -> tuple[int, int, float]:
     end = time.time()
     duration = end - start
 
-    # 追加写入结束时间和耗时
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write("\n" + "-" * 60 + "\n")
         fh.write(f"[JOB {idx}] End time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end))}\n")
