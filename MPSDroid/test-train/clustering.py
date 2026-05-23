@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-对单个 features_train.csv / features_test.csv 的恶意值做 1D 聚类（自动选 k，可选 MiniBatchKMeans）。
-控制台实时显示处理过程；不输出 JSON 摘要。
+1D clustering (with auto k option and optional MiniBatchKMeans) on "malicious value" vectors for a single features_train.csv / features_test.csv pair.
+Progress is displayed live on console; no JSON summary output.
 
-输入:
-  features_train.csv: 列 sha256, seq_values(JSON数组), label
-  features_test.csv : 同上
+Input:
+  features_train.csv: columns sha256, seq_values (JSON array), label
+  features_test.csv : same as above
 
-输出（在 --root-dir 中）:
+Output (inside --root-dir):
   model.joblib
   train/cluster_summary.csv
   train/file_cluster_distribution.csv
   test/cluster_summary.csv
   test/file_cluster_distribution.csv
 
-说明：
-- 每文件簇分布会对所有 sha256 输出一行；即便该 sha 的 seq_values 为空数组，也会写入全 0 的簇计数（并带 label）。
+Notes:
+- Every file's cluster distribution will have one row per sha256; even if a sha's seq_values is empty, a row is written with all zeros for clusters (and the label).
 """
 
 import argparse
@@ -34,7 +34,7 @@ from joblib import dump
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 
-# 提升 CSV 单字段大小上限，避免 "field larger than field limit (131072)"
+# Increase CSV single field size limit to avoid "field larger than field limit (131072)"
 try:
     csv.field_size_limit(sys.maxsize)
 except OverflowError:
@@ -53,7 +53,7 @@ def tprint(msg: str, end: str = "\n", flush: bool = True):
 
 def read_feature_csv(path: str, progress: bool = False) -> List[Tuple[str, List[float], int]]:
     """
-    读取 features_{train|test}.csv，返回 [(sha, [values...], label), ...]
+    Read features_{train|test}.csv and return [(sha, [values...], label), ...]
     """
     rows = []
     start = time.time()
@@ -61,7 +61,7 @@ def read_feature_csv(path: str, progress: bool = False) -> List[Tuple[str, List[
         rd = csv.DictReader(f)
         need = {"sha256", "seq_values", "label"}
         if not need.issubset(set(rd.fieldnames or [])):
-            raise ValueError(f"{path} 缺少必要列: sha256, seq_values, label")
+            raise ValueError(f"{path} missing required columns: sha256, seq_values, label")
         for i, r in enumerate(rd, start=1):
             sha = (r.get("sha256") or "").strip()
             try:
@@ -78,25 +78,25 @@ def read_feature_csv(path: str, progress: bool = False) -> List[Tuple[str, List[
                         vals = []
                 except Exception:
                     vals = []
-            # 过滤成浮点
+            # cast to floats only
             vals = [float(v) for v in vals if isinstance(v, (int, float))]
             rows.append((sha, vals, label))
             if progress and i % 2000 == 0 and is_tty():
-                sys.stdout.write(f"\r读取 {os.path.basename(path)}: {i} 行...".ljust(80))
+                sys.stdout.write(f"\rRead {os.path.basename(path)}: {i} rows...".ljust(80))
                 sys.stdout.flush()
         if progress and is_tty():
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
     if progress:
-        tprint(f"读取完成 {os.path.basename(path)}: {len(rows)} 行，用时 {int(time.time()-start)}s")
+        tprint(f"Finished reading {os.path.basename(path)}: {len(rows)} rows in {int(time.time()-start)}s")
     return rows
 
 
 def flatten_values(rows: List[Tuple[str, List[float], int]]) -> Tuple[np.ndarray, List[str], Dict[str, int]]:
     """
-    将 (sha, [values], label) 扁平化为:
-    - X: 所有恶意值（float64） shape (N,)
-    - owners: 与 X 对齐的 sha 列表
+    Flatten (sha, [values], label) to:
+    - X: all float values, shape (N,)
+    - owners: sha list aligned with X
     - sha_to_label: sha -> label
     """
     vals: List[float] = []
@@ -112,7 +112,7 @@ def flatten_values(rows: List[Tuple[str, List[float], int]]) -> Tuple[np.ndarray
 
 
 def reservoir_sample_1d(X: np.ndarray, k: int, seed: int) -> np.ndarray:
-    """对 1D 向量做蓄水池采样，返回长度<=k 的样本。"""
+    """Reservoir sampling for 1D np.ndarray. Returns a sample with length <= k."""
     n = X.shape[0]
     if k <= 0 or k >= n:
         return X
@@ -135,8 +135,8 @@ def auto_choose_k_on_scores(
     show_progress: bool = False,
 ) -> Tuple[int, float]:
     """
-    使用 silhouette score 在 [k_min, k_max] 上选择最佳 k。
-    分数越高越好。返回 (best_k, best_score)；若无法计算，回退为 k=2。
+    Use silhouette score to choose best k in [k_min, k_max].
+    The greater the score, the better. Return (best_k, best_score); fallback to k=2 if unable to calculate.
     """
     if scores.size < 3:
         n = scores.size
@@ -175,10 +175,10 @@ def auto_choose_k_on_scores(
         if show_progress:
             pct = idx / total * 100.0
             msg = (
-                f"  选择k进度: {idx}/{total} ({pct:5.1f}%) 当前k={k} "
-                f"分数={('nan' if math.isnan(sc) else f'{sc:.4f}')} "
-                f"最优k={best_k} "
-                f"最优分={('nan' if best_sc<0 or math.isnan(best_sc) else f'{best_sc:.4f}')}"
+                f"  Selecting k: {idx}/{total} ({pct:5.1f}%) current k={k} "
+                f"score={('nan' if math.isnan(sc) else f'{sc:.4f}')} "
+                f"best k={best_k} "
+                f"best score={('nan' if best_sc<0 or math.isnan(best_sc) else f'{best_sc:.4f}')}"
             )
             if is_tty():
                 sys.stdout.write("\r" + msg.ljust(120))
@@ -207,31 +207,31 @@ def run_clustering_for_pair(
     show_progress: bool,
 ) -> None:
     begin = time.time()
-    tprint(f"\n=== 开始处理目录: {root_dir} ===")
+    tprint(f"\n=== Begin processing directory: {root_dir} ===")
 
     train_csv = os.path.join(root_dir, "features_train.csv")
     test_csv = os.path.join(root_dir, "features_test.csv")
     if not os.path.isfile(train_csv) or not os.path.isfile(test_csv):
-        raise FileNotFoundError(f"缺少 features_train.csv 或 features_test.csv 于: {root_dir}")
+        raise FileNotFoundError(f"Missing features_train.csv or features_test.csv in: {root_dir}")
 
-    # 读取训练与测试 CSV
-    tprint(f"[{root_dir}] 读取训练 CSV ...")
+    # Read train/test CSVs
+    tprint(f"[{root_dir}] Reading train CSV ...")
     train_rows = read_feature_csv(train_csv, progress=show_progress)
-    tprint(f"[{root_dir}] 读取测试 CSV ...")
+    tprint(f"[{root_dir}] Reading test CSV ...")
     test_rows = read_feature_csv(test_csv, progress=show_progress)
 
-    # 展平训练值
+    # Flatten train values
     X_train, owners_train, sha_to_label_train = flatten_values(train_rows)
     if X_train.size == 0:
-        raise RuntimeError(f"[{root_dir}] 训练集没有任何恶意值")
-    tprint(f"[{root_dir}] 训练恶意值总数: {X_train.size}")
+        raise RuntimeError(f"[{root_dir}] No malicious values in train set")
+    tprint(f"[{root_dir}] Train values count: {X_train.size}")
 
-    # 自动选 k（若未指定）
+    # Choose k (auto or manual)
     if n_clusters and n_clusters > 0:
         k = int(n_clusters)
-        tprint(f"[{root_dir}] 使用固定 k={k}")
+        tprint(f"[{root_dir}] Using fixed k={k}")
     else:
-        tprint(f"[{root_dir}] 自动选择 k，采样上限={auto_k_sample}，范围=[{auto_k_min},{auto_k_max}]")
+        tprint(f"[{root_dir}] Auto selecting k, sample cap={auto_k_sample}, range=[{auto_k_min},{auto_k_max}]")
         X_sample = reservoir_sample_1d(X_train, auto_k_sample, random_state)
         k, sil = auto_choose_k_on_scores(
             X_sample,
@@ -243,23 +243,23 @@ def run_clustering_for_pair(
             show_progress=show_progress,
         )
         if math.isnan(sil):
-            tprint(f"[{root_dir}] 自动选 k={k}")
+            tprint(f"[{root_dir}] Auto-selected k={k}")
         else:
-            tprint(f"[{root_dir}] 自动选 k={k} (silhouette={sil:.4f})")
+            tprint(f"[{root_dir}] Auto-selected k={k} (silhouette={sil:.4f})")
 
-    # 训练聚类模型
+    # Fit clustering model
     mode = "MiniBatchKMeans" if use_minibatch else "KMeans"
     t0 = time.time()
-    tprint(f"[{root_dir}] 训练模型 {mode} (k={k}, n={X_train.size}) ...")
+    tprint(f"[{root_dir}] Training model {mode} (k={k}, n={X_train.size}) ...")
     Model = MiniBatchKMeans if use_minibatch else KMeans
     kmeans = Model(n_clusters=k, random_state=random_state, n_init="auto")
     kmeans.fit(X_train.reshape(-1, 1))
-    tprint(f"[{root_dir}] 模型训练完成，用时 {int(time.time()-t0)}s")
+    tprint(f"[{root_dir}] Model training finished, elapsed {int(time.time()-t0)}s")
 
     centers = kmeans.cluster_centers_.reshape(-1)
 
-    # 训练集聚合
-    tprint(f"[{root_dir}] 预测并统计训练分布 ...")
+    # Aggregate train set
+    tprint(f"[{root_dir}] Predicting and counting train distribution ...")
     t1 = time.time()
     labels_tr = kmeans.predict(X_train.reshape(-1, 1))
     cluster_counts_tr = np.bincount(labels_tr, minlength=k)
@@ -267,12 +267,12 @@ def run_clustering_for_pair(
     per_file_counts_tr: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for sha, lab in zip(owners_train, labels_tr):
         per_file_counts_tr[sha][int(lab)] += 1
-    tprint(f"[{root_dir}] 训练分布统计完成，用时 {int(time.time()-t1)}s")
+    tprint(f"[{root_dir}] Train distribution finished in {int(time.time()-t1)}s")
 
-    # 写训练结果（包含所有 sha，空文件输出全 0）
+    # Write train output (covering all sha, empty file output is all 0s)
     out_train = os.path.join(root_dir, "train")
     os.makedirs(out_train, exist_ok=True)
-    tprint(f"[{root_dir}] 写训练输出 CSV ...")
+    tprint(f"[{root_dir}] Writing train output CSV ...")
     with open(os.path.join(out_train, "cluster_summary.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["cluster", "size", "avg_value", "center"])
@@ -288,17 +288,17 @@ def run_clustering_for_pair(
         all_train_shas = sorted(sha_to_label_train.keys())
         for sha in all_train_shas:
             row = [sha]
-            counts = per_file_counts_tr.get(sha, {})  # 空文件 → 全 0
+            counts = per_file_counts_tr.get(sha, {})  # Empty file => all 0
             for ci in range(k):
                 row.append(int(counts.get(ci, 0)))
             row.append(int(sha_to_label_train.get(sha, -1)))
             w.writerow(row)
-    tprint(f"[{root_dir}] 训练输出完成")
+    tprint(f"[{root_dir}] Train output written")
 
-    # 测试集
+    # Test set
     X_test, owners_test, sha_to_label_test = flatten_values(test_rows)
-    tprint(f"[{root_dir}] 测试恶意值总数: {X_test.size}")
-    tprint(f"[{root_dir}] 预测并统计测试分布 ...")
+    tprint(f"[{root_dir}] Test values count: {X_test.size}")
+    tprint(f"[{root_dir}] Predicting and counting test distribution ...")
     t2 = time.time()
     labels_te = np.array([], dtype=int)
     if X_test.size > 0:
@@ -308,11 +308,11 @@ def run_clustering_for_pair(
     per_file_counts_te: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for sha, lab in zip(owners_test, labels_te):
         per_file_counts_te[sha][int(lab)] += 1
-    tprint(f"[{root_dir}] 测试分布统计完成，用时 {int(time.time()-t2)}s")
+    tprint(f"[{root_dir}] Test distribution finished in {int(time.time()-t2)}s")
 
     out_test = os.path.join(root_dir, "test")
     os.makedirs(out_test, exist_ok=True)
-    tprint(f"[{root_dir}] 写测试输出 CSV ...")
+    tprint(f"[{root_dir}] Writing test output CSV ...")
     with open(os.path.join(out_test, "cluster_summary.csv"), "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["cluster", "size", "avg_value", "center"])
@@ -328,37 +328,37 @@ def run_clustering_for_pair(
         all_test_shas = sorted(sha_to_label_test.keys())
         for sha in all_test_shas:
             row = [sha]
-            counts = per_file_counts_te.get(sha, {})  # 空文件 → 全 0
+            counts = per_file_counts_te.get(sha, {})  # Empty file => all 0
             for ci in range(k):
                 row.append(int(counts.get(ci, 0)))
             row.append(int(sha_to_label_test.get(sha, -1)))
             w.writerow(row)
-    tprint(f"[{root_dir}] 测试输出完成")
+    tprint(f"[{root_dir}] Test output written")
 
-    # 保存模型
-    tprint(f"[{root_dir}] 保存模型 model.joblib ...")
+    # Save model
+    tprint(f"[{root_dir}] Saving model model.joblib ...")
     dump(kmeans, os.path.join(root_dir, "model.joblib"))
-    tprint(f"[{root_dir}] 模型保存完成")
+    tprint(f"[{root_dir}] Model saved")
 
-    tprint(f"=== 完成 {root_dir} (k={kmeans.n_clusters})，总用时 {int(time.time()-begin)}s ===")
+    tprint(f"=== Finished {root_dir} (k={kmeans.n_clusters}), total time {int(time.time()-begin)}s ===")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="按单对 features_train/test.csv 的恶意值做 1D 聚类（自动选 k，显示处理过程）")
+    ap = argparse.ArgumentParser(description="1D clustering (auto-k, progress shown) on malicious value of features_train/test.csv pair")
     ap.add_argument(
         "--root-dir",
        default="./statistic",
-        help="包含 features_train.csv 和 features_test.csv 的目录"
+        help="Directory containing features_train.csv and features_test.csv"
     )
-    ap.add_argument("--n-clusters", type=int, default=2000, help="固定聚类数（>0 时跳过自动选 k）")
-    ap.add_argument("--auto-k-min", type=int, default=1800, help="自动选 k 最小值")
-    ap.add_argument("--auto-k-max", type=int, default=2000, help="自动选 k 最大值")
-    ap.add_argument("--auto-k-sample", type=int, default=20000, help="用于自动选 k 的采样上限（蓄水池采样）")
-    ap.add_argument("--sil-sample-size", type=int, default=10000, help="silhouette 评分采样上限")
-    ap.add_argument("--use-minibatch", action="store_true", help="使用 MiniBatchKMeans（更适合大数据）")
-    ap.add_argument("--random-state", type=int, default=42, help="随机种子")
-    ap.add_argument("--verbose", action="store_true", help="打印更详细日志")
-    ap.add_argument("--progress", action="store_true", help="显示各阶段进度/用时")
+    ap.add_argument("--n-clusters", type=int, default=2000, help="Fixed number of clusters (>0 disables auto-k)")
+    ap.add_argument("--auto-k-min", type=int, default=1800, help="Auto-k: min number of clusters")
+    ap.add_argument("--auto-k-max", type=int, default=2000, help="Auto-k: max number of clusters")
+    ap.add_argument("--auto-k-sample", type=int, default=20000, help="Auto-k: max sample for silhouette scoring (reservoir sample)")
+    ap.add_argument("--sil-sample-size", type=int, default=10000, help="Silhouette score max sample size")
+    ap.add_argument("--use-minibatch", action="store_true", help="Use MiniBatchKMeans (better for large datasets)")
+    ap.add_argument("--random-state", type=int, default=42, help="Random seed")
+    ap.add_argument("--verbose", action="store_true", help="Print more detailed logs")
+    ap.add_argument("--progress", action="store_true", help="Show progress and timing for each stage")
     args = ap.parse_args()
 
     root_dir = os.path.abspath(args.root_dir)

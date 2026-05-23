@@ -17,30 +17,30 @@ def parse_args():
     parser = argparse.ArgumentParser(description='To obtain the call graphs.')
     parser.add_argument(
         '-f', '--file',
-        help='输入根目录：递归查找该目录及子目录下的所有 APK 文件进行处理',
+        help='Input root directory: recursively search and process all APK files under this directory and its subdirectories',
         default="/mnt/data5/Obfuscapk/APK/"
     )
     parser.add_argument(
         '-o', '--output',
-        help='输出根目录：生成的 .gexf 将按输入目录结构自动分类保存',
+        help='Output root directory: generated .gexf files will be categorized according to the input directory structure automatically',
         default="/mnt/data5/Temp/"
     )
     parser.add_argument(
         '-j', '--workers',
         type=int,
         default=max(1, min(os.cpu_count() or 1, 80)),
-        help='进程数（并发数），默认 CPU 核心数-2'
+        help='Number of processes (concurrency), default is CPU cores - 2'
     )
     parser.add_argument(
         '--delete-on-fail', action='store_true',
-        default=True,
-        help='遇到解析/生成调用图失败或 APK 非 zip 格式时自动删除该 APK 文件'
+        default=False,
+        help='Automatically delete the APK file if parsing/generating call graph fails or if APK is not a zip file'
     )
     parser.add_argument(
         '--max-process',
         type=int,
         default=5000,
-        help='最大“待处理”APK 数量（仅限制需要生成 .gexf 的集合；0 表示不限制）'
+        help='Maximum number of APKs to process (limit applies only to those requiring .gexf generation; 0 means no limit)'
     )
     return parser.parse_args()
 
@@ -88,19 +88,19 @@ def compute_gexf_path(app_path, input_root, out_root, create_parent=False):
 
 def apk_to_callgraph(app_path, input_root, out_root, delete_on_fail=False):
     """
-    单个 APK 处理：
-    - 解析 APK
-    - 构建调用图
-    - 输出 .gexf
+    Single APK processing:
+    - Parse the APK
+    - Build the call graph
+    - Output .gexf file
 
-    返回: (消息字符串, 单个 APK 处理耗时秒数)
+    Returns: (message string, processing time in seconds for this APK)
     """
     apk_name = os.path.splitext(os.path.basename(app_path))[0]
 
-    # 统计单个 APK 耗时
+    # Time statistics for single APK
     start_ts = time.time()
 
-    # 非 zip（损坏或伪装）的 APK：根据开关决定是否删除
+    # Not a zip (damaged or disguised) APK: delete file depending on switch
     if not zipfile.is_zipfile(app_path):
         if delete_on_fail:
             try:
@@ -147,7 +147,7 @@ def collect_apks(root_dir):
 
 
 def main():
-    # 在某些环境中使用 spawn 更稳
+    # Use spawn mode in some environments for better stability
     try:
         import multiprocessing as mp
         if mp.get_start_method(allow_none=True) is None:
@@ -155,7 +155,7 @@ def main():
     except Exception:
         pass
 
-    # -------- 总体开始时间 --------
+    # -------- Overall start time --------
     start_ts = time.time()
     start_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_ts))
 
@@ -168,9 +168,9 @@ def main():
     delete_on_fail = args.delete_on_fail
     max_process = args.max_process
 
-    # 用于统计 APK 平均耗时
-    total_apk_time = 0.0   # 所有 APK 的处理总时间（秒）
-    processed_count = 0    # 实际发送到 worker 的 APK 数量
+    # For calculating average APK processing time
+    total_apk_time = 0.0   # Total processing time (sec) for all APKs
+    processed_count = 0    # Total number of APKs actually passed to workers
 
     if os.path.isdir(input_path):
         input_root = input_path[:-1] if input_path.endswith('/') else input_path
@@ -214,7 +214,7 @@ def main():
             else:
                 print("Nothing to do. All needed .gexf already exist or limit is 0.")
     else:
-        # 单文件模式
+        # Single file mode
         input_root = os.path.dirname(os.path.abspath(input_path)) or '.'
         gexf_path = compute_gexf_path(input_path, input_root, out_root, create_parent=False)
         if os.path.exists(gexf_path):
@@ -232,14 +232,14 @@ def main():
             total_apk_time += dur
             processed_count += 1
 
-    # -------- 结束时间与整体耗时 --------
+    # -------- End time and total elapsed --------
     end_ts = time.time()
     end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
     elapsed = end_ts - start_ts
 
     print(f"Total elapsed: {elapsed:.2f}s")
 
-    # 计算并打印平均每个 APK 耗时
+    # Calculate and print average time per APK
     if processed_count > 0:
         avg_per_apk = total_apk_time / processed_count
         print(
@@ -251,7 +251,7 @@ def main():
         avg_per_apk = 0.0
         print("Processed APKs: 0")
 
-    # 将时间统计写入日志文件（追加）
+    # Append time statistics to log file
     log_path = os.path.join(out_root, "run_time.log")
     try:
         with open(log_path, "a", encoding="utf-8") as f:

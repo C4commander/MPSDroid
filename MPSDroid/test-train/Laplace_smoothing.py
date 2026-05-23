@@ -11,8 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import time
 
-
-# ========== 基础工具 ==========
+# ========== Basic Utilities ==========
 
 def infer_label(path: Path, malware_key='malware', benign_key='benign'):
     parts = [p.lower() for p in path.parts]
@@ -23,18 +22,16 @@ def infer_label(path: Path, malware_key='malware', benign_key='benign'):
     else:
         return None
 
-
 def path_sha_no_ext(p: Path) -> str:
     return p.stem
 
-
-# ========== 敏感 API 映射与序列解析 ==========
+# ========== Sensitive API Mapping and Sequence Parsing ==========
 
 def load_sapi_mapping(sapi_path: Path) -> Tuple[Dict[int, str], Set[str]]:
     """
-    读取敏感 API 列表（每行一个 Java 方法签名），构建：
-    - id_to_api: 1-based 序号 -> API 名称
-    - sapi_set: 敏感 API 名称集合
+    Read the sensitive API list (one Java method signature per line), and construct:
+    - id_to_api: 1-based index -> API name
+    - sapi_set: set of sensitive API names
     """
     ordered, seen = [], set()
     with open(sapi_path, 'r', encoding='utf-8') as f:
@@ -46,12 +43,11 @@ def load_sapi_mapping(sapi_path: Path) -> Tuple[Dict[int, str], Set[str]]:
     id_to_api = {i + 1: api for i, api in enumerate(ordered)}
     return id_to_api, set(ordered)
 
-
 def extract_sensitive_apis_from_txt(txt_path: Path,
                                     id_to_api: Dict[int, str],
                                     sapi_set: Set[str]) -> List[str]:
     """
-    从 .txt 序列文件中提取“文件级”敏感 API 使用集合（去重）。
+    Extract a file-level set of used sensitive APIs (deduplicated) from a .txt sequence file.
     """
     used = set()
     try:
@@ -75,8 +71,7 @@ def extract_sensitive_apis_from_txt(txt_path: Path,
         raise
     return sorted(used)
 
-
-# ========== 缓存 ==========
+# ========== Cache ==========
 
 def write_api_cache(cache_file: Path, apis: List[str]) -> None:
     cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -85,13 +80,11 @@ def write_api_cache(cache_file: Path, apis: List[str]) -> None:
             f.write(a)
             f.write("\n")
 
-
 def read_api_cache(cache_file: Path) -> List[str]:
     if not cache_file.exists():
         return []
     with gzip.open(cache_file, "rt", encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
-
 
 def preprocess_one_file(fpath: Path,
                         malware_key: str,
@@ -101,8 +94,8 @@ def preprocess_one_file(fpath: Path,
                         id_to_api: Dict[int, str],
                         sapi_set: Set[str]) -> Dict:
     """
-    读取一个 .txt 序列文件 -> 根据 SAPI 映射将 ID 还原为敏感 API 名称 -> 去重 -> 写入缓存
-    返回字典包括 path, sha, label, cache_path, n_apis, error
+    Read a .txt sequence file -> restore sensitive API names from IDs using the SAPI mapping -> deduplicate -> write to cache
+    Returns a dictionary including path, sha, label, cache_path, n_apis, error
     """
     sha = path_sha_no_ext(fpath)
     label = infer_label(fpath, malware_key, benign_key)
@@ -134,8 +127,7 @@ def preprocess_one_file(fpath: Path,
 
     return ret
 
-
-# ========== 统计权重（基于缓存） ==========
+# ========== Compute Weights (Based on Cache) ==========
 
 def compute_weights_from_cache(train_items: List[Tuple[Path, str]],
                                cache_dir: Path,
@@ -143,7 +135,7 @@ def compute_weights_from_cache(train_items: List[Tuple[Path, str]],
                                alpha: int = 2,
                                verbose: bool = False):
     """
-    基于缓存文件计算恶意/良性中 API 的“文件级出现计数”，并计算熵和权重。
+    Compute the 'file-level occurrence count' of sensitive APIs in malware/goodware based on cache files, and calculate entropy and weight.
     """
     from collections import defaultdict
 
@@ -152,7 +144,7 @@ def compute_weights_from_cache(train_items: List[Tuple[Path, str]],
     n_malware = 0
     n_benign = 0
 
-    for fpath, label in tqdm(train_items, desc="读取训练缓存并计数API", disable=not verbose):
+    for fpath, label in tqdm(train_items, desc="Read training cache and count APIs", disable=not verbose):
         sha = path_sha_no_ext(fpath)
         cache_file = cache_dir / f"{sha}.txt.gz"
         apis = read_api_cache(cache_file)
@@ -226,53 +218,51 @@ def compute_weights_from_cache(train_items: List[Tuple[Path, str]],
     }
     return df, stats
 
-
-# ========== 目录扫描工具 ==========
+# ========== Directory Scanning Tools ==========
 
 def collect_txt_files(root_dir: Path) -> List[Path]:
     """
-    从给定目��递归收集所有 .txt 文件。
-    用于 train-dir / test-dir；目录下包含 malware/benign 子目录。
+    Recursively collect all .txt files from the given directory.
+    Used for train-dir / test-dir; these directories contain malware/benign subdirectories.
     """
     if not root_dir.exists():
         return []
     return list(root_dir.rglob("*.txt"))
 
-
-# ========== 主流程（训练/测试目录） ==========
+# ========== Main Procedure (Train/Test Directories) ==========
 
 def main():
     start_ts = time.time()
     start_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_ts))
 
     parser = argparse.ArgumentParser(
-        description='敏感API熵和权重统计（训练/测试为两个目录，目录下含 malware/benign 子目录）'
+        description='Sensitive API entropy and weight statistics (train/test are two directories with malware/benign subdirectories)'
     )
     parser.add_argument('--train-dir', type=str, default="/mnt/data2/wb2024/Methodology/MPSDroid/test-train/Sequences/train",
-                        help='训练集根目录（其下包含 malware 和 benign 子目录，里面是 .txt 序列文件）')
+                        help='Training set root directory (should include malware and benign subdirs containing .txt sequence files)')
     parser.add_argument('--test-dir', type=str, default="/mnt/data2/wb2024/Methodology/MPSDroid/test-train/Sequences/test",
-                        help='测试集根目录（其下包含 malware 和 benign 子目录，里面是 .txt 序列文件）')
+                        help='Test set root directory (should include malware and benign subdirs containing .txt sequence files)')
 
-    parser.add_argument('--malware-key', type=str, default='malware', help='恶意目录关键字')
-    parser.add_argument('--benign-key', type=str, default='benign', help='良性目录关键字')
+    parser.add_argument('--malware-key', type=str, default='malware', help='Malware directory keyword')
+    parser.add_argument('--benign-key', type=str, default='benign', help='Benign directory keyword')
     parser.add_argument('--output-dir', type=str, default="./statistic",
-                        help='输出目录根路径')
+                        help='Output root directory path')
 
     parser.add_argument('--sapi', type=str, default="./APIChecker_PScout.txt",
-                        help='敏感 API 列表路径（与生成 .txt 序列时使用的列表一致）')
+                        help='Sensitive API list path (should match the list used to generate the .txt sequences)')
 
     parser.add_argument('--min-count', type=int, default=2,
-                        help='API保留的最小出现次数（基于训练集统计）')
+                        help='Minimum API occurrence count to keep (based on training set statistics)')
     parser.add_argument('--verbose', action='store_true', default=True,
-                        help='显示详细进度')
+                        help='Show detailed progress')
 
     parser.add_argument('--workers', type=int,
                         default=max(8, min(120, (os.cpu_count() or 64))),
-                        help='预处理并行线程数（IO 密集，使用线程池较合适）')
+                        help='Number of preprocessing parallel threads (I/O intensive, thread pool is preferred)')
     parser.add_argument('--cache-dir', type=str, default=None,
-                        help='API缓存目录（默认在输出目录下的api_cache）')
+                        help='API cache directory (default is api_cache under output-dir)')
     parser.add_argument('--reuse-cache', action='store_true', default=True,
-                        help='若缓存已存在则复用，跳过 .txt 解析')
+                        help='Reuse existing cache if available, skip .txt parsing')
 
     args = parser.parse_args()
 
@@ -281,10 +271,10 @@ def main():
     cache_dir = Path(args.cache_dir) if args.cache_dir else (out_root / "api_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # 0) 载入敏感 API 映射
+    # 0) Load sensitive API mapping
     sapi_path = Path(args.sapi)
     if not sapi_path.exists():
-        print(f"敏感 API 列表不存在: {sapi_path}")
+        print(f"Sensitive API list not found: {sapi_path}")
         end_ts = time.time()
         end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
         elapsed = end_ts - start_ts
@@ -302,7 +292,7 @@ def main():
 
     id_to_api, sapi_set = load_sapi_mapping(sapi_path)
 
-    # 1) 扫描训练/测试目录并打标签
+    # 1) Scan train/test directories and label them
     train_root = Path(args.train_dir)
     test_root = Path(args.test_dir)
 
@@ -310,10 +300,10 @@ def main():
     test_files = collect_txt_files(test_root)
 
     if not train_files:
-        print(f"训练目录下未找到任何 .txt 文件，请检查 --train-dir: {train_root}")
+        print(f"No .txt files found under train directory, check --train-dir: {train_root}")
         return
     if not test_files:
-        print(f"测试目录下未找到任何 .txt 文件，请检查 --test-dir: {test_root}")
+        print(f"No .txt files found under test directory, check --test-dir: {test_root}")
         return
 
     train_items = []
@@ -322,10 +312,10 @@ def main():
         if label in ('malware', 'benign'):
             train_items.append((f, label))
     if not train_items:
-        print("训练集中未找到带有恶意/良性标签的序列 .txt 文件，检查目录与关键字。")
+        print("No .txt sequence files with malware/benign label found in the training set, check directories and keywords.")
         return
 
-    # 保存清单（便于之后复查）
+    # Save lists (for further inspection)
     (out_root / "train_seq_list.txt").write_text(
         "\n".join(str(p) for p in sorted(train_files)), encoding="utf-8"
     )
@@ -338,9 +328,9 @@ def main():
     (out_root / "train_sha.txt").write_text("\n".join(train_shas), encoding="utf-8")
     (out_root / "test_sha.txt").write_text("\n".join(test_shas), encoding="utf-8")
 
-    # 2) 预处理：训练集 + 测试集 全部做缓存
+    # 2) Preprocessing: cache all APIs for both train and test sets
     all_files = list({*train_files, *test_files})
-    print(f"[INFO] 预处理序列 .txt -> 缓存API列表至: {cache_dir} ，线程数: {args.workers}，reuse_cache={args.reuse_cache}")
+    print(f"[INFO] Preprocessing sequence .txt -> caching API list to: {cache_dir}, threads: {args.workers}, reuse_cache={args.reuse_cache}")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -361,19 +351,19 @@ def main():
             ): f for f in all_files
         }
         for fut in tqdm(as_completed(futures), total=len(futures),
-                        desc="预处理序列 .txt", disable=not args.verbose):
+                        desc="Preprocessing sequence .txt", disable=not args.verbose):
             info = fut.result()
             index_rows.append(info)
             if info.get("error"):
                 n_errors += 1
-                print(f"[ERROR] 预处理失败: {info['path']}\n{info['error']}")
+                print(f"[ERROR] Preprocessing failed: {info['path']}\n{info['error']}")
 
     index_df = pd.DataFrame(index_rows)
     index_csv = out_root / "api_cache_index.csv"
     index_df.to_csv(index_csv, index=False, encoding="utf-8-sig")
-    print(f"[INFO] 已保存缓存索引: {index_csv}，失败: {n_errors}")
+    print(f"[INFO] Saved cache index: {index_csv}, failed: {n_errors}")
 
-    # 3) 基于训练集缓存计算权重
+    # 3) Compute weights based on training set cache
     df_weights, stats = compute_weights_from_cache(
         train_items=train_items,
         cache_dir=cache_dir,
@@ -392,10 +382,10 @@ def main():
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    print(f"[INFO] 已保存 权重: {weights_csv}  统计: n_train={meta['n_train']} "
+    print(f"[INFO] Saved weights: {weights_csv}  Stats: n_train={meta['n_train']} "
           f"n_test={meta['n_test']} n_api_after_filter={meta['n_api_after_filter']}")
 
-    # ---- 结束时间 & 日志 ----
+    # ---- End time & Logging ----
     end_ts = time.time()
     end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
     elapsed = end_ts - start_ts
@@ -412,7 +402,6 @@ def main():
             )
     except Exception as e:
         print(f"WARNING: failed to write time log: {e}")
-
 
 if __name__ == '__main__':
     main()
