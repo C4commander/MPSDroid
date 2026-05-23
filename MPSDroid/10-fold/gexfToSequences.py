@@ -32,7 +32,6 @@ def parse_args():
     )
     p.add_argument(
         '-s', '--sapi',
-        #default="/mnt/data2/wb2024/Methodology/MyWay/analyze/删除没出现的结果API.txt",
         default="/mnt/data2/wb2024/Data/Sensitive_inf/APIChecker_dot.txt",
         help='敏感 API 列表（每行一个，已是 Java 方法名，如 android.telephony.SmsManager.sendTextMessage）。用于缩点与输出 ID 序列（1-based）。'
     )
