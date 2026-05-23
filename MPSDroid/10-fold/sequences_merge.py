@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高并行版本：处理敏感 API 序列数据（single-cell 输出，带进度）。
-修复点：
-- 更完整地提取 .txt：递归 data_root 下任意层级的 malware/benign 子目录
-- 空序列文件也会保留记录（seq_values 为 []）
-- 仅进行一次全局相似度合并计算，然后将结果按每折的 train/test 切分复用，避免重复计算
-- 移除 fold_jobs 并行扇出逻辑：统一顺序写出每折结果
+High-parallelism version: process sensitive API sequence data (single-cell output, with progress).
+Fixes:
+- More complete .txt extraction: recursively traverse all levels in data_root for malware/benign subdirs
+- Empty sequence files are also included (seq_values is [])
+- Only a single global similarity merging computation, then split and reuse for each fold's train/test, avoiding redundant computation
+- Removed fold_jobs parallel scatter logic: all fold results are written in order
 
-输入：
+Input:
 - fold_root/fold_XX/{weights.csv, train_sha.txt, test_sha.txt}
-- data_root 下的任意路径中包含 malware 或 benign 的子目录里的 *.txt（文件名为 sha256）
+- Any path in data_root containing malware or benign subdirectories with *.txt (filename is sha256)
 
-输出（每个 fold_XX 内）：
-- features_train.csv（列：sha256, seq_values(JSON数组), label）
+Output (in each fold_XX):
+- features_train.csv (columns: sha256, seq_values (JSON array), label)
 - features_test.csv
-- metadata.json（参数与统计）
+- metadata.json (parameters and stats)
 """
 
 import argparse
@@ -30,11 +30,11 @@ from typing import Dict, List, Tuple
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# 固定输出文件名前缀
+# Fixed output file prefix
 OUTPUT_PREFIX = 'features'
 
 # -----------------------------
-# 工具函数与通用输出
+# Utility functions and generic output
 # -----------------------------
 def _norm_header(s: str) -> str:
     return s.lstrip('\ufeff').strip().lower()
@@ -89,7 +89,7 @@ def print_progress(prefix: str, done: int, total: int, start_time: float,
         print(line)
 
 # -----------------------------
-# 权重与敏感 API
+# Weights and Sensitive APIs
 # -----------------------------
 def load_api_weights(weights_file: Path, encoding='utf-8') -> Dict[str, float]:
     api_weights = {}
@@ -99,10 +99,10 @@ def load_api_weights(weights_file: Path, encoding='utf-8') -> Dict[str, float]:
         dialect = sniff_dialect(sample)
         reader = csv.DictReader(f, dialect=dialect)
         if not reader.fieldnames:
-            raise ValueError(f"无法读取权重表头: {weights_file}")
+            raise ValueError(f"Cannot read weight file headers: {weights_file}")
         norm2orig = {_norm_header(h): h for h in reader.fieldnames if h}
         if 'api' not in norm2orig or 'weight' not in norm2orig:
-            raise ValueError(f"weights.csv 缺少必须列(API, weight): {weights_file}\n实际表头: {reader.fieldnames}")
+            raise ValueError(f"weights.csv is missing required columns (API, weight): {weights_file}\nActual headers: {reader.fieldnames}")
         api_col = norm2orig['api']
         weight_col = norm2orig['weight']
         for row in reader:
@@ -125,19 +125,19 @@ def load_sensitive_api_list(file_path: Path, encoding='utf-8') -> List[str]:
             if name:
                 apis.append(name)
     if not apis:
-        raise ValueError("敏感 API 列表文件为空。")
+        raise ValueError("Sensitive API list file is empty.")
     return apis
 
 # -----------------------------
-# 扫描与预加载（修复扫描不完整）
+# Scanning and Preloading (fixed scanning for completeness)
 # -----------------------------
 def _infer_label_from_parts(parts: List[str]) -> int:
     """
-    根据路径分段推断标签：
-    - 若分段中出现 'malware' 则 1
-    - 若分段中出现 'benign'  则 0
-    若两者都出现，按更靠近文件的分段优先（即从末尾向前找第一个匹配）。
-    若都无，返回 -1。
+    Infer label from path segments:
+    - If 'malware' appears in the parts, label is 1
+    - If 'benign' appears in the parts, label is 0
+    If both appear, choose the one closer to the file (scan from the end).
+    If neither, return -1.
     """
     for seg in reversed(parts):
         s = seg.lower()
@@ -149,10 +149,10 @@ def _infer_label_from_parts(parts: List[str]) -> int:
 
 def scan_sha_files(data_root: Path) -> Dict[str, Tuple[Path, int]]:
     """
-    深度递归扫描 data_root 下任意层级的 malware/benign 子目录里的 *.txt（大小写不敏感）。
-    - 文件名（去掉 .txt）作为 sha
-    - 标签由路径分段中出现的 'malware' / 'benign' 判定
-    - 如同一 sha 在不同位置重复出现，保留首次记录并打印警告
+    Recursively scan all levels in data_root for malware/benign subdirectories containing *.txt (case-insensitive).
+    - Filename (minus .txt) is used as sha
+    - Label is determined from path segments ('malware'/'benign')
+    - If the same sha appears in multiple places, only the first is kept and warn about duplicates
     """
     mapping: Dict[str, Tuple[Path, int]] = {}
     duplicates = 0
@@ -170,10 +170,10 @@ def scan_sha_files(data_root: Path) -> Dict[str, Tuple[Path, int]]:
             if sha in mapping:
                 duplicates += 1
                 if duplicates <= 10:
-                    print(f"[WARN] 重复 sha 检测到，忽略后者: {sha} -> {file_path}")
+                    print(f"[WARN] Duplicate sha detected, skipping later: {sha} -> {file_path}")
                 continue
             mapping[sha] = (file_path, label)
-    print(f"[INFO] 扫描完成：共识别 {len(mapping)} 个 sha（malware/benign 任意层级），重复 {duplicates} 个被忽略。")
+    print(f"[INFO] Scan finished: {len(mapping)} sha found (malware/benign at any level), {duplicates} duplicates ignored.")
     return mapping
 
 def preload_all_sequences(sha_mapping: Dict[str, Tuple[Path, int]],
@@ -182,7 +182,7 @@ def preload_all_sequences(sha_mapping: Dict[str, Tuple[Path, int]],
                           verbose=False,
                           show_progress=False) -> Dict[str, List[List[int]]]:
     """
-    预加载所有 sha 的序列（整数编号列表）。空文件会得到空列表 []，保证后续仍有记录。
+    Preload sequences (list of integer indices) for all sha. Empty files get empty list [] to preserve the record.
     """
     max_api_index = len(sensitive_api_list)
     all_data = {}
@@ -201,35 +201,35 @@ def preload_all_sequences(sha_mapping: Dict[str, Tuple[Path, int]],
                     for p in parts:
                         if not p.isdigit():
                             if verbose:
-                                print(f"[WARN] {sha}:{line_no} 非数字 '{p}' 忽略")
+                                print(f"[WARN] {sha}:{line_no} non-digit '{p}' skipped")
                             continue
                         idx = int(p)
                         if 1 <= idx <= max_api_index:
                             idx_list.append(idx - 1)  # 0-based
                         else:
                             if verbose:
-                                print(f"[WARN] {sha}:{line_no} 编号 {idx} 超出范围 1..{max_api_index} 忽略")
+                                print(f"[WARN] {sha}:{line_no} index {idx} out of range 1..{max_api_index} skipped")
                     if idx_list:
                         sequences.append(idx_list)
-            all_data[sha] = sequences  # 空文件 -> []
+            all_data[sha] = sequences  # Empty file -> []
         except Exception as e:
             if verbose:
-                print(f"[ERROR] 预加载 {file_path} 失败: {e}")
+                print(f"[ERROR] Preload failed for {file_path}: {e}")
             all_data[sha] = []
     if show_progress:
         elapsed = time.time() - start
-        print(f"[PRELOAD] 完成，共 {total} 个 sha，elapsed={format_seconds(elapsed)}")
+        print(f"[PRELOAD] Done, total {total} sha, elapsed={format_seconds(elapsed)}")
     return all_data
 
 # -----------------------------
-# 相似合并核心（倒排表 + 权重比值剪枝）
+# Similarity merging core (inverted index + weight ratio pruning)
 # -----------------------------
 def compute_sequence_weights_and_sets(raw_sequences: List[List[int]],
                                       api_weight_array: List[float]):
     """
-    对每条原始序列：
-    - 计算恶意值（序列内允许重复，但对权重求和按出现次数相加）
-    - 生成去重后的升序索引列表（用于并集与倒排）
+    For each raw sequence:
+    - Compute "malicious value" (sum of weights, including duplicates)
+    - Build deduplicated sorted index list (for merging and inverted index)
     """
     seq_weights = []
     unique_sets = []
@@ -247,11 +247,11 @@ def merge_sequences_union_unique(seq_weights: List[float],
                                  api_weight_array: List[float],
                                  similarity_threshold: float) -> List[float]:
     """
-    采用倒排表 + 权重区间剪枝的高效合并算法：
-    - 相似度 sim(A,B) = 恶意值(A∩B) / max(WA, WB)
-    - 仅通过 item 倒排生成候选对，并在累计交集时使用必要条件 WB ∈ [t·WA, WA/t] 过滤
-    - 达到阈值的对用并查集合并，最后对每个连通分量计算“并集”的恶意值
-    返回各合并簇的恶意值列表（降序），与原实现一致的输出格式。
+    Efficient merging algorithm using inverted index & weight range pruning:
+    - sim(A,B) = malicious_value(A∩B) / max(WA, WB)
+    - Only generate candidates via item inverted index, and prune with necessary WB ∈ [t·WA, WA/t]
+    - Merge pairs reaching the threshold with a union-find structure; for each connected component, sum the union value
+    Returns a list of merged values (descending), consistent with previous output.
     """
     n = len(seq_weights)
     if n == 0:
@@ -259,10 +259,9 @@ def merge_sequences_union_unique(seq_weights: List[float],
 
     t = float(similarity_threshold)
     if not (0.0 < t < 1.0):
-        # 不改变外部参数接口，但保证健壮性
         t = max(1e-9, min(t, 0.999999))
 
-    # 1) 预处理：过滤出权重>0的 items，构建倒排表 item -> [seq_ids]
+    # 1) Preprocessing: filter items with weight > 0, build inverted index item -> [seq_ids]
     inverted_index: Dict[int, List[int]] = defaultdict(list)
     seq_items_nz: List[List[int]] = []
     for sid, items in enumerate(unique_sets):
@@ -272,7 +271,7 @@ def merge_sequences_union_unique(seq_weights: List[float],
         for it in nz:
             inverted_index[it].append(sid)
 
-    # 2) 并查集
+    # 2) Union-find
     parent = list(range(n))
     size = [1] * n
     def find(x: int) -> int:
@@ -289,7 +288,7 @@ def merge_sequences_union_unique(seq_weights: List[float],
         parent[rb] = ra
         size[ra] += size[rb]
 
-    # 3) 遍历每个序列作为 A，使用倒排表累计交集，加阈值验证并合并
+    # 3) For every sequence as A, use the inverted index to accumulate intersections, merge those over threshold
     for a in range(n):
         WA = seq_weights[a]
         if WA <= 0.0:
@@ -322,7 +321,7 @@ def merge_sequences_union_unique(seq_weights: List[float],
             if inter_w >= t * denom:
                 union(a, b)
 
-    # 4) 归并连通分量并计算并集恶意值
+    # 4) Merge connected components and sum the union malicious value
     comps = defaultdict(list)
     for k in range(n):
         comps[find(k)].append(k)
@@ -345,7 +344,7 @@ def process_single_sha(raw_sequences: List[List[int]],
     return merge_sequences_union_unique(seq_weights, unique_sets, api_weight_array, similarity_threshold)
 
 # -----------------------------
-# 并行处理与 CSV 写出
+# Parallel processing and CSV output
 # -----------------------------
 def read_sha_list(path: Path, encoding='utf-8') -> List[str]:
     lst = []
@@ -372,7 +371,7 @@ def compute_all_parallel(shas: List[str],
     with ProcessPoolExecutor(max_workers=workers) as executor:
         future_to_sha = {}
         for sha in shas:
-            raw_seqs = sha_sequences.get(sha, [])  # 空文件将得到 []
+            raw_seqs = sha_sequences.get(sha, [])  # Empty file yields []
             fut = executor.submit(process_single_sha, raw_seqs, api_weight_array, similarity_threshold)
             future_to_sha[fut] = sha
 
@@ -399,11 +398,11 @@ def write_single_cell(out_path: Path,
                       dry_run=False,
                       verbose=False):
     """
-    将全局计算好的 feats_global 按指定 sha_list 顺序写出 single-cell CSV。
+    Write the global feats_global values in sha_list order to a single-cell CSV.
     """
     if dry_run:
         if verbose:
-            print(f"[DRY_RUN] 跳过写入 {out_path}")
+            print(f"[DRY_RUN] Skipped writing {out_path}")
         return
     header = ['sha256', 'seq_values', 'label']
     with out_path.open('w', newline='', encoding=encoding) as f:
@@ -425,13 +424,13 @@ def write_fold_outputs(fold_dir: Path,
                        encoding='utf-8',
                        dry_run=False,
                        verbose=False):
-    # 写出 train/test
+    # Write train/test
     write_single_cell(fold_dir / f'{OUTPUT_PREFIX}_train.csv', train_shas,
                       feats_global, sha_mapping, encoding, dry_run, verbose)
     write_single_cell(fold_dir / f'{OUTPUT_PREFIX}_test.csv', test_shas,
                       feats_global, sha_mapping, encoding, dry_run, verbose)
 
-    # 写出元信息（结构保持不变）
+    # Write metadata (structure unchanged)
     meta = {
         'fold': fold_dir.name,
         'similarity_threshold': similarity_threshold,
@@ -442,7 +441,7 @@ def write_fold_outputs(fold_dir: Path,
         'sensitive_api_file': 'PRELOADED',
         'output_prefix': OUTPUT_PREFIX,
         'output_layout': 'single-cell',
-        'note': '空序列文件也会写入（seq_values=[]）',
+        'note': 'Empty sequence files are included (seq_values=[])',
         'workers_used': workers_used
     }
     if not dry_run:
@@ -452,19 +451,19 @@ def write_fold_outputs(fold_dir: Path,
         print(f"[DONE] {fold_dir.name}: train={len(train_shas)} test={len(test_shas)}")
 
 # -----------------------------
-# 主入口（移除折并行）
+# Main entry point (fold computation not parallelized)
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="处理敏感 API 序列数据（single-cell 输出）。")
-    parser.add_argument('--fold_root', default="/mnt/data2/wb2024/Methodology/MyWay2.0/fold_outputs-mc", help='包含 fold_01...fold_10 的目录路径')
-    parser.add_argument('--sensitive_api_file', default="/mnt/data2/wb2024/Methodology/MyWay/analyze/删除没出现的结果API.txt", help='敏感 API 名称列表文件路径')
-    parser.add_argument('--data_root', default="/mnt/data2/wb2024/Methodology/MyWay/data/Sequences-mc", help='包含 malware / benign 子目录的根路径')
-    parser.add_argument('--similarity_threshold', type=float, default=0.3, help='序列相似度阈值')
-    parser.add_argument('--workers', type=int, default=120, help='进程数，默认=CPU核心数(上限128)')
+    parser = argparse.ArgumentParser(description="Process sensitive API sequence data (single-cell output).")
+    parser.add_argument('--fold_root', default="/mnt/data2/wb2024/Methodology/MyWay2.0/fold_outputs-mc", help='Directory containing fold_01...fold_10')
+    parser.add_argument('--sensitive_api_file', default="/mnt/data2/wb2024/Methodology/MyWay/analyze/删除没出现的结果API.txt", help='Sensitive API name list file path')
+    parser.add_argument('--data_root', default="/mnt/data2/wb2024/Methodology/MyWay/data/Sequences-mc", help='Root containing malware/benign subdirs')
+    parser.add_argument('--similarity_threshold', type=float, default=0.3, help='Sequence similarity threshold')
+    parser.add_argument('--workers', type=int, default=120, help='Number of processes, default=CPU core count (max 128)')
     parser.add_argument('--encoding', default='utf-8')
     parser.add_argument('--dry_run', action='store_true')
     parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--progress', action='store_true', help='显示进度条形式', default=True)
+    parser.add_argument('--progress', action='store_true', help='Show progress bar', default=True)
     args = parser.parse_args()
 
     fold_root = Path(args.fold_root)
@@ -472,21 +471,21 @@ def main():
     data_root = Path(args.data_root)
 
     if not fold_root.exists():
-        print(f"[ERROR] fold_root 不存在: {fold_root}")
+        print(f"[ERROR] fold_root not found: {fold_root}")
         sys.exit(1)
     if not sensitive_api_file.exists():
-        print(f"[ERROR] 敏感 API 文件不存在: {sensitive_api_file}")
+        print(f"[ERROR] Sensitive API file not found: {sensitive_api_file}")
         sys.exit(1)
     if not data_root.exists():
-        print(f"[ERROR] data_root 不存在: {data_root}")
+        print(f"[ERROR] data_root not found: {data_root}")
         sys.exit(1)
 
     sensitive_api_list = load_sensitive_api_list(sensitive_api_file, encoding=args.encoding)
 
-    # 深度扫描
+    # Deep scan
     sha_mapping = scan_sha_files(data_root)
 
-    # 预加载所有序列（空文件 => [] 也会保存）
+    # Preload all sequences (empty file => [] also saved)
     sha_sequences = preload_all_sequences(
         sha_mapping,
         sensitive_api_list,
@@ -495,16 +494,16 @@ def main():
         show_progress=args.progress
     )
 
-    # 列出 folds
+    # List all folds
     fold_dirs = sorted([
         p for p in fold_root.iterdir()
         if p.is_dir() and re.match(r'fold_\d{2}$', p.name)
     ])
     if not fold_dirs:
-        print(f"[ERROR] 未找到 fold_XX 目录于 {fold_root}")
+        print(f"[ERROR] No fold_XX directories found under {fold_root}")
         sys.exit(1)
 
-    # 并行 workers 计算
+    # Use #workers for parallel execution
     import multiprocessing
     cpu_count = multiprocessing.cpu_count()
     total_workers = args.workers if args.workers > 0 else cpu_count
@@ -514,7 +513,7 @@ def main():
     if args.verbose or args.progress:
         print(f"[INFO] CPU={cpu_count} total_workers={total_workers}")
 
-    # 读取所有 fold 的 sha 列表，并构建全量 union
+    # Read all sha lists for all folds and construct global union
     per_fold_shas: Dict[str, Tuple[List[str], List[str]]] = {}
     union_shas = []
     union_seen = set()
@@ -522,7 +521,7 @@ def main():
         train_sha_file = fd / 'train_sha.txt'
         test_sha_file = fd / 'test_sha.txt'
         if not train_sha_file.exists() or not test_sha_file.exists():
-            print(f"[WARN] 缺少 train/test sha 文件: {fd} 跳过该 fold")
+            print(f"[WARN] Missing train/test sha file: {fd} skipping this fold")
             continue
         train_shas = read_sha_list(train_sha_file, encoding=args.encoding)
         test_shas = read_sha_list(test_sha_file, encoding=args.encoding)
@@ -537,21 +536,21 @@ def main():
                 union_shas.append(s)
 
     if not union_shas:
-        print("[ERROR] 所有 folds 的 train/test 列表皆为空。")
+        print("[ERROR] All train/test lists in all folds are empty.")
         sys.exit(1)
 
-    # 使用第一个 fold 的 weights.csv 作为全局权重（各折数据一致，避免重复计算）
+    # Use the first fold's weights.csv as the global weight (folds have identical configs, avoid redundant computation)
     ref_fold = fold_dirs[0]
     weights_file = ref_fold / 'weights.csv'
     if not weights_file.exists():
-        print(f"[ERROR] 缺少 weights.csv: {weights_file}")
+        print(f"[ERROR] weights.csv missing: {weights_file}")
         sys.exit(1)
     api_weights_map = load_api_weights(weights_file, encoding=args.encoding)
     api_weight_array = [api_weights_map.get(name, 0.0) for name in sensitive_api_list]
 
-    # 全局一次性计算所有样本的合并结果
+    # One-shot global similarity/merging computation for all samples
     if args.verbose or args.progress:
-        print(f"[INFO] 开始全局计算，共 {len(union_shas)} 个样本（一次性相似度/合并）")
+        print(f"[INFO] Starting global computation, {len(union_shas)} samples (single similarity/merge run)")
     global_features = compute_all_parallel(
         union_shas,
         sha_sequences,
@@ -562,7 +561,7 @@ def main():
         show_progress=args.progress
     )
 
-    # 顺序写出每个 fold 的结果（复用全局计算）
+    # Sequentially write results for each fold (reuse global calculation)
     for fd in fold_dirs:
         if fd.name not in per_fold_shas:
             continue

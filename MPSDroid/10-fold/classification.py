@@ -8,7 +8,7 @@ import time
 
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-from sklearn.neighbors import KNeighborsClassifier  # 新增：KNN
+from sklearn.neighbors import KNeighborsClassifier  # Added: KNN
 
 try:
     import xgboost as xgb
@@ -44,7 +44,7 @@ def select_model(model_type: str, seed: int):
         )
     elif model_type == 'xgb':
         if not HAS_XGB:
-            raise ImportError("xgboost 未安装，请选择其他模型或安装 xgboost")
+            raise ImportError("xgboost is not installed. Please select another model or install xgboost")
         return xgb.XGBClassifier(
             random_state=seed,
             colsample_bytree=0.8,  # 0.8
@@ -57,16 +57,16 @@ def select_model(model_type: str, seed: int):
             eval_metric='logloss'
         )
     elif model_type == 'knn':
-        # 新增：KNN 模型，这里给一个比较常见的默认配置
-        # 如果你有特定需求，可以修改 n_neighbors、weights 等参数
+        # Added: KNN model, this is a common default configuration.
+        # If you have custom requirements, set n_neighbors, weights, etc. as needed.
         return KNeighborsClassifier(
             n_neighbors=3,
-            weights='distance',   # 或 'uniform'
-            metric='minkowski',   # p=2 即欧氏距离
+            weights='distance',   # or 'uniform'
+            metric='minkowski',   # p=2 is Euclidean distance
             p=2
         )
     else:
-        raise ValueError("model_type 必须为 'rf'、'et'、'gbdt'、'xgb' 或 'knn'")
+        raise ValueError("model_type must be 'rf', 'et', 'gbdt', 'xgb', or 'knn'")
 
 
 def nanmean_fmt(arr):
@@ -76,48 +76,48 @@ def nanmean_fmt(arr):
 
 def determine_feature_columns(df_tr: pd.DataFrame, df_te: pd.DataFrame, quiet: bool = False):
     """
-    新的特征列逻辑：
-    - 假定第一列是 sha256（不作为特征）
-    - 假定最后一列是 label（不作为特征）
-    - 其它全部列作为特征
-    兼容健壮性：
-    - 若 label 不在最后一列，依旧排除列名为 label
-    - 若第一列不是 sha256 也依旧按“位置第一列”排除；并给出提示
+    Feature column logic:
+    - Assume first column is sha256 (not a feature)
+    - Assume last column is label (not a feature)
+    - All other columns are used as features
+    Robustness:
+    - If label is not the last column, still exclude the "label" column by name
+    - If the first column is not sha256, still exclude the first column by position and show a warning
     """
     cols_tr = list(df_tr.columns)
 
     if "label" not in cols_tr:
-        raise KeyError("训练集中缺少 label 列")
+        raise KeyError("Label column missing in training set")
     if "label" not in df_te.columns:
-        raise KeyError("测试集中缺少 label 列")
+        raise KeyError("Label column missing in test set")
 
     if len(cols_tr) < 3:
-        raise ValueError("列数不足：至少需要 sha256、一个特征列、label")
+        raise ValueError("Not enough columns: Requires sha256, at least one feature, and label")
 
     first_col = cols_tr[0]
     last_col = cols_tr[-1]
 
     if not quiet:
         if first_col.lower() != "sha256":
-            print(f"[WARN] 第一列名称不是 sha256，而是 '{first_col}'，仍按位置排除第一列")
+            print(f"[WARN] The first column is not sha256 but '{first_col}', still excluding by position")
         if last_col != "label":
-            print(f"[WARN] 最后一列名称不是 label，而是 '{last_col}'，将另外排除真正的 label 列")
+            print(f"[WARN] The last column is not label but '{last_col}', will also remove the true label column by name")
 
-    # 基于位置排除第一与最后一列
+    # Exclude the first and last columns by position
     feat_cols = cols_tr[1:-1]
 
-    # 若 label 不在最后一列，额外排除
+    # If label is not the last column, also exclude 'label'
     if last_col != "label" and "label" in feat_cols:
         feat_cols = [c for c in feat_cols if c != "label"]
 
-    # 也确保 sha256 不被误包含（如果不是第一列但出现于中间）
+    # Also ensure sha256 is not included in the features (if it appears in the middle)
     feat_cols = [c for c in feat_cols if c.lower() != "sha256"]
 
     if not feat_cols:
-        raise ValueError("未能得到任何特征列（除去第一与最后之后为空）。")
+        raise ValueError("No feature columns found (all removed after excluding the first and last columns).")
 
     if not quiet:
-        print(f"[INFO] 使用特征列数量: {len(feat_cols)}，示例前5个: {feat_cols[:5]}")
+        print(f"[INFO] Number of feature columns used: {len(feat_cols)}, first 5: {feat_cols[:5]}")
     return feat_cols
 
 
@@ -126,30 +126,30 @@ def eval_one_fold(train_csv: str, test_csv: str, seed: int, model_type: str, qui
     df_te = pd.read_csv(test_csv, encoding="utf-8-sig")
 
     if "label" not in df_tr.columns or "label" not in df_te.columns:
-        raise KeyError(f"缺少 label 列: {train_csv} 或 {test_csv}")
+        raise KeyError(f"Label column missing in: {train_csv} or {test_csv}")
 
-    # 仅保留标签 0/1
+    # Only keep labels 0/1
     df_tr = df_tr[df_tr["label"].isin([0, 1])].copy()
     df_te = df_te[df_te["label"].isin([0, 1])].copy()
 
-    # 新的特征列逻辑
+    # Feature column logic
     feat_cols = determine_feature_columns(df_tr, df_te, quiet=quiet)
 
-    # 测试集与训练特征对齐：缺的补0，多的丢弃
+    # Align test set to fitted features: fill missing with zero, drop extra
     for c in feat_cols:
         if c not in df_te.columns:
             df_te[c] = 0
     X_tr = df_tr[feat_cols].values
     y_tr = df_tr["label"].values.astype(int)
-    # 只保留训练确定的列顺序
+    # Only keep the sequence from training for test
     X_te = df_te[feat_cols].values
     y_te = df_te["label"].values.astype(int)
 
-    # 若训练集单一类别跳过
+    # Skip if training set is single class
     uniq_tr = np.unique(y_tr)
     if uniq_tr.size < 2:
         if not quiet:
-            print(f"[WARN] 训练集仅包含单一类别 {uniq_tr.tolist()}，跳过该折: {train_csv}")
+            print(f"[WARN] Training set contains only one class {uniq_tr.tolist()}, skipping this fold: {train_csv}")
         return None
 
     clf = select_model(model_type, seed)
@@ -183,10 +183,10 @@ def eval_one_fold(train_csv: str, test_csv: str, seed: int, model_type: str, qui
 def external_folds_evaluation(folds_root: str, seed: int, model_type: str, quiet: bool = False):
     folds = sorted([p for p in glob.glob(os.path.join(folds_root, "fold_*")) if os.path.isdir(p)])
     if not folds:
-        raise FileNotFoundError(f"未找到折目录: {folds_root}/fold_*")
+        raise FileNotFoundError(f"No fold directories found: {folds_root}/fold_*")
 
     if not quiet:
-        print(f"发现 {len(folds)} 折，开始外部折评估...")
+        print(f"Found {len(folds)} folds, starting external fold evaluation...")
 
     per_fold = []
     for fdir in folds:
@@ -196,7 +196,7 @@ def external_folds_evaluation(folds_root: str, seed: int, model_type: str, quiet
         test_csv = os.path.join(fdir, "test", "file_cluster_distribution.csv")
         if not os.path.isfile(train_csv) or not os.path.isfile(test_csv):
             if not quiet:
-                print(f"[WARN] 缺少 train/test 分布CSV，跳过该折: {fdir}")
+                print(f"[WARN] Missing train/test distribution CSV, skipping this fold: {fdir}")
             continue
 
         metrics = eval_one_fold(train_csv, test_csv, seed, model_type, quiet=quiet)
@@ -229,13 +229,15 @@ def external_folds_evaluation(folds_root: str, seed: int, model_type: str, quiet
 
 
 def main():
-    parser = argparse.ArgumentParser(description="每折输出进行外部折测试与平均汇总（特征=除第一与最后列外全部列）")
-    parser.add_argument("--folds-root", default="/mnt/data2/wb2024/Methodology/MyWay2.0/fold_outputs-mc", help="包含 fold_01, fold_02 等目录的根路径")
-    parser.add_argument("--model-type", choices=["rf", "et", "gbdt", "xgb", "knn"], default="xgb", help="分类模型类型") 
-    parser.add_argument("--random-state", type=int, default=42, help="随机种子（对树模型有效，knn 无随机性）")
-    parser.add_argument("--report-json", type=str, default=None, help="评估结果JSON路径（默认 folds-root/model_eval_summary_merge.json）")
-    parser.add_argument("--report-csv", type=str, default=None, help="逐折评估结果CSV路径（默认 folds-root/model_eval_per_fold_merge.csv）")
-    parser.add_argument("--quiet", action="store_true", help="减少日志输出")
+    parser = argparse.ArgumentParser(
+        description="External fold testing and averaging for each fold (features=all columns except first/last)."
+    )
+    parser.add_argument("--folds-root", default="/mnt/data2/wb2024/Methodology/MyWay2.0/fold_outputs-mc", help="Root directory containing subdirs fold_01, fold_02, etc.")
+    parser.add_argument("--model-type", choices=["rf", "et", "gbdt", "xgb", "knn"], default="xgb", help="Classification model type") 
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed (affects tree models, KNN is deterministic)")
+    parser.add_argument("--report-json", type=str, default=None, help="Evaluation results JSON path (default: folds-root/model_eval_summary_merge.json)")
+    parser.add_argument("--report-csv", type=str, default=None, help="Evaluation results per fold in CSV (default: folds-root/model_eval_per_fold_merge.csv)")
+    parser.add_argument("--quiet", action="store_true", help="Reduce log output")
     args = parser.parse_args()
 
     per_fold, avg = external_folds_evaluation(
@@ -246,7 +248,7 @@ def main():
     )
 
     if avg:
-        print("\n平均指标:")
+        print("\nAverage metrics:")
         print(
             f"F1={avg.get('F1', float('nan')):.4f}, "
             f"Precision={avg.get('Precision', float('nan')):.4f}, "
@@ -258,7 +260,7 @@ def main():
             f"FNR={avg.get('FNR', float('nan')):.4f}"
         )
     else:
-        print("\n无可用折用于计算平均（可能全部被跳过）。")
+        print("\nNo valid folds for averaging (possibly all skipped).")
 
     folds_root = args.folds_root
     if args.report_json is None:
@@ -276,17 +278,17 @@ def main():
         }
         with open(args.report_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"评估摘要JSON写入: {args.report_json}")
+        print(f"Evaluation summary JSON written: {args.report_json}")
     except Exception as e:
-        print(f"[WARN] 写入JSON失败: {e}")
+        print(f"[WARN] Failed to write JSON: {e}")
 
     try:
         ok_rows = [r for r in per_fold if r.get("status") == "ok"]
         if ok_rows:
             pd.DataFrame(ok_rows).to_csv(args.report_csv, index=False, encoding="utf-8-sig")
-            print(f"逐折评估结果CSV写入: {args.report_csv}")
+            print(f"Per fold evaluation results written to CSV: {args.report_csv}")
     except Exception as e:
-        print(f"[WARN] 写入CSV失败: {e}")
+        print(f"[WARN] Failed to write CSV: {e}")
 
 
 if __name__ == "__main__":

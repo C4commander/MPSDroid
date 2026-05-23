@@ -11,15 +11,15 @@ import numpy as np
 import gzip
 from typing import List, Tuple, Dict, Optional
 
-# 对java格式的API做了适配
-# 例如配对能够.txt的 "android.telephony.SmsManager.sendDataMessage"格式
-# 对全图所有的度做中心性统计，筛选处在SAPI中的作为特征，拼接 sha256 和 标签 输出为.csv文件
-# 目录获取改为：递归遍历 dataset_path 下所有子目录，找到名为 benign 和 malware 的目录后再处理
-# 修复点：
-# 1) 递归收集 benign/malware 下所有层级的 .gexf/.gexf.gz 文件（大小写不敏感）
-# 2) 单文件异常不影响整体（map 内部捕获）
-# 3) 正确剥离双扩展名（.gexf.gz）获取 sha256
-# 4) 兼容读取 gzip 压缩的 GEXF
+# Adapted for Java-style API format
+# For example, able to match .txt's "android.telephony.SmsManager.sendDataMessage" format
+# Computes centrality statistics for all nodes in the graph, selects those in SAPI as features, appends sha256 and label, then outputs as .csv
+# Directory traversal updated: recursively searches dataset_path for all subdirectories, only processing those named benign or malware
+# Bug fixes:
+# 1) Recursively collect all .gexf/.gexf.gz files (case-insensitive) under benign/malware directories
+# 2) Single-file errors do not affect the whole processing (handled in map)
+# 3) Correctly strips double suffix (.gexf.gz) to obtain sha256
+# 4) Compatible with reading gzip-compressed GEXF
 
 def parseargs():
     parser = argparse.ArgumentParser(description='Malware Detection with centrality.')
@@ -59,7 +59,7 @@ def obtain_sensitive_apis(file):
 
 def _strip_gexf_suffixes(path: str) -> str:
     """
-    从文件名剥离 .gexf / .gexf.gz（大小写不敏感），返回主干名（通常是 sha256）
+    Strip .gexf / .gexf.gz (case-insensitive) from the filename, return the stem (usually sha256)
     """
     name = os.path.basename(path)
     lower = name.lower()
@@ -67,12 +67,12 @@ def _strip_gexf_suffixes(path: str) -> str:
         return name[:-(len('.gexf.gz'))]
     if lower.endswith('.gexf'):
         return name[:-(len('.gexf'))]
-    # 回退：只去掉最后一个扩展名
+    # Fallback: only strip the last extension
     return os.path.splitext(name)[0]
 
 def callgraph_extraction(file):
     """
-    兼容读取 .gexf 和 .gexf.gz
+    Support for reading both .gexf and .gexf.gz formats
     """
     try:
         lower = file.lower()
@@ -101,7 +101,7 @@ def gexf_node_to_api_format(node_name):
         return node_name
 
 def get_vector(node_centrality, sensitive_apis):
-    # 建立一个从API格式到中心性值的映射
+    # Build a map from API format to centrality value
     node_api_map = {}
     for node, value in node_centrality.items():
         api_fmt = gexf_node_to_api_format(node)
@@ -115,11 +115,11 @@ def degree_centrality_feature(CG, sensitive_apis):
     node_centrality = nx.degree_centrality(CG)
     return get_vector(node_centrality, sensitive_apis)
 
-# --------- 非递归 Katz 实现（幂迭代），避免递归限制 ----------
+# --------- Non-recursive Katz implementation (power iteration), avoids recursion limit ----------
 def _safe_alpha_for_katz(G, default_alpha=0.01):
     """
-    给定图，返回一个较安全的 alpha，用于确保 Katz 中心性收敛。
-    使用度的上界来估计谱半径的上界：alpha < 1 / lambda_max <= 1 / d_max
+    For a given graph, return a safe alpha to ensure Katz centrality convergence.
+    Estimate the upper bound of spectral radius using max degree: alpha < 1 / lambda_max <= 1 / d_max
     """
     try:
         if G.is_directed():
@@ -127,16 +127,16 @@ def _safe_alpha_for_katz(G, default_alpha=0.01):
         else:
             degrees = [d for _, d in G.degree()]
         dmax = max(degrees) if degrees else 1
-        # 0.9/dmax 留一点余量，和默认值取较小值更稳健
+        # 0.9/dmax leaves some margin, pick the smaller of that and default for robustness
         return float(min(default_alpha, 0.9 / max(1.0, dmax)))
     except Exception:
         return float(default_alpha)
 
 def _katz_centrality_power(G, alpha=None, beta=1.0, max_iter=10000, tol=1e-6, use_weights=False):
     """
-    使用幂迭代求解 Katz 中心性：x_{t+1} = alpha * A * x_t + beta
-    - 非递归实现，避免递归深度限制
-    - 若安装 SciPy 则优先使用稀疏矩阵计算，否则回退到 NumPy dense
+    Compute Katz centrality with power iteration: x_{t+1} = alpha * A * x_t + beta
+    - Non-recursive implementation, avoids recursion limit
+    - Prefer sparse matrix with SciPy if available, fallback to NumPy dense otherwise
     """
     nodes = list(G.nodes())
     n = len(nodes)
@@ -148,7 +148,7 @@ def _katz_centrality_power(G, alpha=None, beta=1.0, max_iter=10000, tol=1e-6, us
 
     weight = 'weight' if use_weights else None
 
-    # 尝试使用 SciPy 稀疏矩阵
+    # Try using SciPy sparse matrix
     A = None
     use_scipy = False
     try:
@@ -163,26 +163,26 @@ def _katz_centrality_power(G, alpha=None, beta=1.0, max_iter=10000, tol=1e-6, us
         except Exception:
             A = None
 
-    # 如果没有 SciPy 或构建失败，则使用 NumPy dense
+    # If no SciPy or build fails, use NumPy dense
     if A is None:
         A = nx.to_numpy_array(G, nodelist=nodes, dtype=float, weight=weight)
 
     x = np.ones(n, dtype=float)
     b = np.ones(n, dtype=float) * beta
 
-    # 迭代
+    # Iterations
     for _ in range(max_iter):
         if use_scipy and hasattr(A, "dot"):
             x_new = alpha * (A.dot(x)) + b
         else:
             x_new = alpha * (A @ x) + b
-        # 使用 L1 范数判断收敛
+        # Use L1 norm for convergence check
         if np.linalg.norm(x_new - x, 1) < tol * n:
             x = x_new
             break
         x = x_new
 
-    # 可选：归一化，避免数值过大
+    # Optional: normalization to avoid large numbers
     s = np.sum(x)
     if s > 0:
         x = x / s
@@ -213,12 +213,12 @@ def eigenvector_centrality_feature(CG, sensitive_apis):
     try:
         node_centrality = nx.eigenvector_centrality(CG, max_iter=1000)
     except nx.NetworkXException:
-        # 万一不收敛，返回0向量
+        # If not converged, return all-zero vector
         node_centrality = {node: 0 for node in CG.nodes()}
     return get_vector(node_centrality, sensitive_apis)
 
 def authority_centrality_feature(CG, sensitive_apis):
-    # 使用 hits 算法获取 authority 分数
+    # Use the HITS algorithm to get authority scores
     try:
         _, authority_scores = nx.hits(CG, max_iter=1000)
     except nx.NetworkXException:
@@ -237,7 +237,7 @@ CENTRALITY_FUNCS = {
 
 def find_benign_malware_dirs(root_dir: str):
     """
-    递归遍历 root_dir，收集所有名为 'benign' 和 'malware' 的目录路径。
+    Recursively traverse root_dir, collect all directory paths named 'benign' and 'malware'.
     """
     benign_dirs = []
     malware_dirs = []
@@ -251,7 +251,7 @@ def find_benign_malware_dirs(root_dir: str):
 
 def collect_gexf_files(root_dir: str, recursive: bool = True) -> List[str]:
     """
-    收集 root_dir 下所有 .gexf / .gexf.gz 文件（大小写不敏感）
+    Collect all .gexf / .gexf.gz files (case-insensitive) under root_dir
     """
     ret = []
     if recursive:
@@ -272,7 +272,7 @@ def collect_gexf_files(root_dir: str, recursive: bool = True) -> List[str]:
 
 def _safe_compute_one(file: str, centrality_type: str, sensitive_apis: List[str]) -> Optional[Tuple[str, List[float]]]:
     """
-    安全地计算单个文件的特征，任何异常都只影响该文件，不影响全局。
+    Safely compute features for a single file; any exception only affects this file and will not affect others.
     """
     try:
         CG = callgraph_extraction(file)
@@ -297,13 +297,13 @@ def obtain_dataset(dataset_path, centrality_type, sensitive_apis):
         print(f"Error: dataset path does not exist: {dataset_path}", flush=True)
         return Vectors, Labels
 
-    # 递归查找所有名为 benign 和 malware 的目录
+    # Recursively find all directories named benign and malware
     benign_dirs, malware_dirs = find_benign_malware_dirs(dataset_path)
 
     if not benign_dirs and not malware_dirs:
         print(f"Warning: No 'benign' or 'malware' directories found under: {dataset_path}", flush=True)
 
-    # 递归收集所有 gexf 文件（包含 .gexf.gz，大小写不敏感）
+    # Recursively collect all gexf files (including .gexf.gz, case-insensitive)
     apps_b = []
     for bdir in benign_dirs:
         apps_b.extend(collect_gexf_files(bdir, recursive=True))
@@ -311,7 +311,7 @@ def obtain_dataset(dataset_path, centrality_type, sensitive_apis):
     for mdir in malware_dirs:
         apps_m.extend(collect_gexf_files(mdir, recursive=True))
 
-    # 去重并排序，保证稳定性
+    # Deduplicate and sort for stability
     apps_b = sorted(set(apps_b))
     apps_m = sorted(set(apps_m))
 
@@ -325,7 +325,7 @@ def obtain_dataset(dataset_path, centrality_type, sensitive_apis):
         pool.close()
         pool.join()
 
-    # 过滤掉失败的 None
+    # Filter out None (failed) results
     results_b = [r for r in results_b if r is not None]
     results_m = [r for r in results_m if r is not None]
 
@@ -335,7 +335,7 @@ def obtain_dataset(dataset_path, centrality_type, sensitive_apis):
     Vectors.extend(results_m)
     Labels.extend([1 for _ in range(len(results_m))])
 
-    # 提示是否有文件被跳过
+    # Inform if any files were skipped
     skipped_b = len(apps_b) - len(results_b)
     skipped_m = len(apps_m) - len(results_m)
     if skipped_b or skipped_m:
