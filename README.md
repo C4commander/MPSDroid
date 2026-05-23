@@ -21,7 +21,7 @@ This repository provides **two execution modes** with the *same internal steps/f
 ## Repository Structure
 
 - `MPSDroid/test-train/`  
-  Fixed train/test split workflow (includes a one-click runner: `run_all.py`)
+  Fixed train/test split workflow
 
 - `MPSDroid/10-fold/`  
   10-fold workflow (fold-based outputs + per-fold evaluation + average metrics)
@@ -41,26 +41,19 @@ Each directory typically contains:
 
 ---
 
-## Requirements
+## Requirements / Environment Setup
 
-This project is 100% Python. Typical dependencies used in the scripts include:
+This project is **100% Python**.
 
-- `androguard`
-- `networkx`
-- `numpy`, `pandas`
-- `scikit-learn`
-- `tqdm`
-- Optional: `xgboost` (only if you select the XGBoost model in classification)
+### Install dependencies
 
-Install (example):
+Use the provided `requirements.txt`:
 
 ```bash
-pip install androguard networkx numpy pandas scikit-learn tqdm
-# optional
-pip install xgboost
+pip install -r requirements.txt
 ```
 
-> Exact versions may depend on your environment. If you run into dependency issues, pin versions based on your Python/OS setup.
+> Tip: It is recommended to install in a virtual environment (venv/conda) to avoid dependency conflicts.
 
 ---
 
@@ -132,28 +125,9 @@ Trains and evaluates a classifier and outputs metrics (ACC/Precision/Recall/F1, 
 
 ## Mode A: Fixed Train/Test Split (`MPSDroid/test-train`)
 
-### Option 1: One-click run (recommended)
-`run_all.py` calls the core steps in order:
-- Laplace smoothing stats
-- sequence merge
-- clustering
-- concat for train and test
-- classification
+> `run_all.py` has been removed. Please run each stage manually in order.
 
-Run:
-
-```bash
-cd MPSDroid/test-train
-python run_all.py
-```
-
-Logs are written under:
-```text
-MPSDroid/test-train/logs/
-```
-
-### Option 2: Run step-by-step
-If you want to run each step manually:
+### Run step-by-step
 
 ```bash
 cd MPSDroid/test-train
@@ -177,6 +151,9 @@ python sequences_merge.py --help
 python clustering.py --help
 
 # 7) concatenate features
+# IMPORTANT: For test-train mode, concat.py needs to be run TWICE:
+#   - once for the TRAIN dataset feature concatenation
+#   - once for the TEST dataset feature concatenation
 python concat.py --help
 
 # 8) classify
