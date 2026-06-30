@@ -1,47 +1,48 @@
 import os
 import argparse
 import networkx as nx
+from collections import defaultdict
 from functools import partial
 from multiprocessing import Pool as ProcessPool
 from math import ceil
 from utils import dalvik_to_java_method
 
-# Try importing lxml's exception type (NetworkX reads GEXF usually using lxml)
+# Try to import lxml's exception types (NetworkX GEXF reading usually uses lxml)
 try:
     import lxml.etree as LET
 except Exception:
     LET = None
 
-import xml.etree.ElementTree as ET  # Fallback for parser exception type (some environments will throw ET.ParseError)
+import xml.etree.ElementTree as ET  # Fallback parser exception type (some environments will throw ET.ParseError)
 import time  # Used for time statistics
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Recursively extract method sequences from GEXF graphs under a root dir: convert Dalvik nodes to Java method names, then contract to the provided sensitive APIs (remove non-sensitive nodes and connect their neighbors); then output sequences with linear path cover (O(V+E)), avoiding exponential all-path enumeration. Output retains original relative directory structure.'
+        description='Recursively extract method sequences from GEXF graphs: first convert Dalvik nodes to Java method names, then perform contraction according to the provided sensitive APIs (delete non-sensitive nodes and connect their neighbors); finally, output sequences using a linear path cover (O(V+E)) to avoid exponential enumeration of all paths. Output keeps the original relative directory structure.'
     )
     p.add_argument(
         '-f', '--from-root', dest='gexf_root',
-        default="/mnt/data5/Temp/",
-        help='Input root directory containing GEXF files (recursively traverses subdirectories)'
+        default="/mnt/data2/wb2024/Methodology/MyWay/data/Graph-md",
+        help='Input root directory containing GEXF files (recursively find subdirectories)'
     )
     p.add_argument(
         '-o', '--output_root',
-        default="./Sequences",
-        help='Output root directory (keeps input files\' relative subdirectory structure)'
+        default="/mnt/data2/wb2024/Methodology/MyWay/data/Sequences-md",
+        help='Output root directory (will keep the input file\'s relative directory structure)'
     )
     p.add_argument(
         '-s', '--sapi',
-        default="./APIChecker_dot.txt",
-        help='List of sensitive APIs (one per line, already in Java method format, e.g., android.telephony.SmsManager.sendTextMessage). Used for contraction and outputting ID sequence (1-based).'
+        default="/mnt/data2/wb2024/Data/Sensitive_inf/APIChecker_PScout.txt",
+        help='Sensitive API list (one per line, already Java method names, e.g., android.telephony.SmsManager.sendTextMessage). Used for contraction and output ID sequences (1-based).'
     )
     p.add_argument(
-        '-w', '--workers', type=int, default=max(1, min((os.cpu_count() or 1), 120)),
+        '-w', '--workers', type=int, default=min((os.cpu_count() or 1), 120),
         help='Number of parallel processes (default: number of CPU cores).'
     )
     p.add_argument(
         '--force', action='store_true',
-        help='Ignore existing .txt sequence files and force regeneration.',
+        help='Ignore existing .txt sequence files, force regenerate.',
         default=True
     )
     return p.parse_args()
@@ -55,15 +56,15 @@ def load_sapi_map(sapi_path):
             if api and api not in seen:
                 seen.add(api)
                 ordered.append(api)
-    # map to 1-based ids
+    # Map to 1-based ids
     return {api: i + 1 for i, api in enumerate(ordered)}
 
 
 def relabel_graph_nodes_to_java(CG: nx.Graph) -> nx.DiGraph:
     """
     Convert Dalvik node names in the graph to Java method names.
-    - Unparsable nodes are kept unchanged (later removed during contraction).
-    - Merge nodes with the same name and parallel edges (convert to DiGraph).
+    - Unparsable nodes stay as-is (later they will be removed during contraction).
+    - Merge duplicate node names and parallel edges (convert to DiGraph).
     """
     mapping = {}
     for n in CG.nodes():
@@ -74,28 +75,92 @@ def relabel_graph_nodes_to_java(CG: nx.Graph) -> nx.DiGraph:
     return nx.DiGraph(CG2)
 
 
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _mapped_java_name(node_id: str, node_label: str = "") -> str:
+    raw_id = str(node_id or "").strip()
+    raw_label = str(node_label or "").strip()
+
+    java = dalvik_to_java_method(raw_id)
+    if java:
+        return java
+
+    if raw_label and raw_label != raw_id:
+        java = dalvik_to_java_method(raw_label)
+        if java:
+            return java
+
+    return raw_id or raw_label
+
+
+def read_gexf_as_java_digraph(gexf_path: str):
+    """
+    Stream-parse a GEXF file and directly build the relabelled DiGraph.
+
+    This avoids the expensive path of:
+    1. fully loading the original graph with nx.read_gexf(...)
+    2. copying it again with nx.relabel_nodes(..., copy=True)
+    """
+    graph = nx.DiGraph()
+    id_to_name = {}
+    unresolved_edges = []
+
+    context = ET.iterparse(gexf_path, events=("end",))
+    for _, elem in context:
+        tag = _xml_local_name(elem.tag)
+
+        if tag == "node":
+            node_id = elem.get("id", "")
+            node_label = elem.get("label", "")
+            mapped = _mapped_java_name(node_id, node_label)
+            id_to_name[node_id] = mapped
+            graph.add_node(mapped)
+        elif tag == "edge":
+            source = elem.get("source", "")
+            target = elem.get("target", "")
+            src_name = id_to_name.get(source)
+            dst_name = id_to_name.get(target)
+            if src_name is not None and dst_name is not None:
+                graph.add_edge(src_name, dst_name)
+            else:
+                unresolved_edges.append((source, target))
+
+        elem.clear()
+
+    if unresolved_edges:
+        for source, target in unresolved_edges:
+            src_name = id_to_name.get(source)
+            dst_name = id_to_name.get(target)
+            if src_name is not None and dst_name is not None:
+                graph.add_edge(src_name, dst_name)
+
+    return graph
+
+
 def contract_to_sensitive(CG: nx.DiGraph, sensitive_set: set) -> nx.DiGraph:
     """
-    Memory-friendly contraction implementation:
-    - Only retain sensitive nodes.
-    - If there is a path u -> ... -> v (only passing non-sensitive nodes in between), add edge u -> v to the contracted graph.
-    - Do not build pred/succ copies for the whole graph, do not copy large adjacency structures;
-    - For each sensitive source, do a non-recursive forward traversal, using only a local visited set and stack, thus lowering peak memory.
+    Memory-friendly contraction:
+    - Retain only sensitive nodes;
+    - If there is a path u -> ... -> v (only passing non-sensitive nodes), add edge u -> v in the result graph;
+    - Do not build pred/succ copies for whole graph, do not copy a large adjacency structure;
+    - For each sensitive source node, perform a non-recursive forward traversal using only a local visited set and stack, to significantly reduce peak memory.
     """
     if not sensitive_set:
         return CG
 
     H = nx.DiGraph()
 
-    # Only add sensitive nodes that exist in the original graph, retain isolated sensitive nodes
+    # Only add sensitive nodes appearing in the original graph; retain isolated sensitive nodes
     present_sensitive = [n for n in CG.nodes if n in sensitive_set]
     H.add_nodes_from(present_sensitive)
 
-    # Use local reference for faster membership checking
+    # Use a local reference to speed up sensitivity checking
     is_sensitive = sensitive_set.__contains__
 
     for src in present_sensitive:
-        # Local visited is per source, to avoid global visited set usage
+        # Local visited for each src traversal, avoids global-level visited overhead
         visited = set()
         stack = list(CG.successors(src))
 
@@ -106,18 +171,18 @@ def contract_to_sensitive(CG: nx.DiGraph, sensitive_set: set) -> nx.DiGraph:
             visited.add(cur)
 
             if is_sensitive(cur):
-                # Found sensitive target, add edge and do not continue from here (avoids traversing other sensitive nodes in between)
+                # Found a sensitive target, connect edge and do not continue from here (ensure no other sensitive node is traversed in between)
                 if cur != src:
                     H.add_edge(src, cur)
                 continue
 
-            # Non-sensitive node, keep going
-            # Use adjacency view generator, not list copy
+            # Non-sensitive node, keep extending forward
+            # Use adjacency view generator, avoid copying to list
             for nxt in CG.successors(cur):
                 if nxt not in visited:
                     stack.append(nxt)
 
-    # Remove possible self loops (theoretically should already be avoided)
+    # Remove possible self-loops (should already be avoided)
     H.remove_edges_from(nx.selfloop_edges(H))
     return H
 
@@ -140,12 +205,11 @@ def _kmp_build(pattern):
     return lps
 
 
-def _kmp_contains(text, pattern):
+def _kmp_contains_with_lps(text, pattern, lps):
     if not pattern:
         return True
     if len(pattern) > len(text):
         return False
-    lps = _kmp_build(pattern)
     i = j = 0
     while i < len(text):
         if text[i] == pattern[j]:
@@ -164,47 +228,57 @@ def _kmp_contains(text, pattern):
 def prune_subsequences_tuples(seq_tuples):
     seq_tuples_sorted = sorted(seq_tuples, key=len, reverse=True)
     kept = []
+    kept_by_token = defaultdict(list)
     for cand in seq_tuples_sorted:
         is_sub = False
-        for big in kept:
+        lps = _kmp_build(cand)
+        candidate_indexes = kept_by_token.get(cand[0], []) if cand else range(len(kept))
+        seen_indexes = set()
+        for idx in candidate_indexes:
+            if idx in seen_indexes:
+                continue
+            seen_indexes.add(idx)
+            big = kept[idx]
             if len(big) < len(cand):
                 continue
-            if _kmp_contains(big, cand):
+            if _kmp_contains_with_lps(big, cand, lps):
                 is_sub = True
                 break
         if not is_sub:
+            idx = len(kept)
             kept.append(cand)
+            for token in set(cand):
+                kept_by_token[token].append(idx)
     return kept
 
 
 def decompose_paths_linear(CG: nx.DiGraph):
     """
-    Decompose the graph into a set of linear paths covering all edges in O(V+E):
-    - Start nodes: indegree != 1 or outdegree != 1, and nodes with indegree 0;
-    - From each start, follow the unique outgoing chain; if outdegree > 1, branch for each unvisited edge but do not enumerate combinations,
-      each edge is traversed only once (marked by visited_edges).
-    - For all unexplored edges (possibly in cycles or isolated branches), start from the source node and linearly extend until no more.
-    Returns a list of node sequences (each sequence a node list).
+    Decompose the graph into O(V+E) linear paths covering all edges:
+    - Start nodes: nodes with indegree != 1 or outdegree != 1, and nodes with indegree 0;
+    - For each start node, extend along the unique successor chain; if the current node has outdegree > 1, start a new branch for each unvisited edge, but do not enumerate combinations.
+      Each edge is traversed only once (marked by visited_edges).
+    - For remaining uncovered edges (possibly in cycles or isolated branches), start linear extension from the source until hitting a visited edge or being unable to continue.
+    Return a list of node sequences (each is a node list).
     """
     if CG.number_of_nodes() == 0:
         return []
 
-    # Use stable adjacency snapshots to avoid changes during iteration
+    # Use stable adjacency snapshots to avoid costs from view mutation during iteration
     succs = {n: list(CG.successors(n)) for n in CG.nodes}
     preds = {n: list(CG.predecessors(n)) for n in CG.nodes}
 
-    visited_edges = set()  # holds (u, v)
+    visited_edges = set()  # Store (u, v)
     paths = []
 
     def extend_from(u, first_v=None):
         """
         Start extending a linear path from node u.
-        - If first_v is provided, start from edge (u, first_v); otherwise, for each outgoing edge, start new path.
-        - Only continue along out_degree==1 chains; if a branch, stop extension (branches are started anew later).
-        Returns the formed path (node sequence). If no edges to walk, returns [u].
+        - If first_v is given, start from edge (u, first_v); else choose unvisited outgoing edges from u;
+        - Only continue along out-degree==1 chains; stop when branching (handled by higher-caller or filled in later).
+        Return the path (node sequence). If no path with length >=1 can be formed (no edge), return single-node path.
         """
         path = [u]
-        # Determine the starting successor
         next_candidates = succs[u] if first_v is None else [first_v]
         v_choice = None
         for v in next_candidates:
@@ -215,15 +289,14 @@ def decompose_paths_linear(CG: nx.DiGraph):
                 break
 
         if v_choice is None:
-            # No successor edge, return single node path
+            # No available successor edge, return single node path
             return path
 
-        # Continue extension
+        # Do linear extension
         cur = v_choice
         path.append(cur)
         while True:
             outs = succs.get(cur, [])
-            # Only continue linearly if outdegree==1
             if len(outs) != 1:
                 break
             nxt = outs[0]
@@ -235,7 +308,7 @@ def decompose_paths_linear(CG: nx.DiGraph):
             cur = nxt
         return path
 
-    # (1) Initial start nodes: indegree != 1 or outdegree != 1, plus indegree 0 nodes
+    # (1) Initial start nodes: indegree != 1 or outdegree != 1, and nodes with indegree 0
     candidate_starts = set()
     for n in CG.nodes:
         indeg = len(preds[n])
@@ -243,17 +316,16 @@ def decompose_paths_linear(CG: nx.DiGraph):
         if indeg == 0 or indeg != 1 or outdeg != 1:
             candidate_starts.add(n)
 
-    # First process true starts (indegree 0), covering DAG sources
+    # First cover DAG sources (nodes with indegree 0)
     zero_in_nodes = [n for n in CG.nodes if len(preds[n]) == 0]
     for s in zero_in_nodes:
-        # For each unvisited outgoing edge, start linear extension to cover all edges
         for v in succs[s]:
             if (s, v) not in visited_edges:
                 path = extend_from(s, v)
                 if path:
                     paths.append(path)
 
-    # Then from all other non 1-1 structured nodes
+    # Then start from other non 1-1 structure nodes
     for s in candidate_starts:
         for v in succs[s]:
             if (s, v) not in visited_edges:
@@ -261,7 +333,7 @@ def decompose_paths_linear(CG: nx.DiGraph):
                 if path:
                     paths.append(path)
 
-    # (2) Cover remaining unvisited edges (possibly in cycles or branches)
+    # (2) Fill in remaining uncovered edges (may come from cycles or uncovered branches)
     for u in CG.nodes:
         for v in succs[u]:
             if (u, v) not in visited_edges:
@@ -269,8 +341,7 @@ def decompose_paths_linear(CG: nx.DiGraph):
                 if path:
                     paths.append(path)
 
-    # Remove singleton "paths" (if a node has no edges), but keep isolated nodes as single-element paths
-    # To preserve behavior, always emit isolated nodes as single-node sequences.
+    # Remove singleton "paths" (where a node has no edges), but retain isolated nodes as single-node paths.
     isolated_nodes = [n for n in CG.nodes if len(succs[n]) == 0 and len(preds[n]) == 0]
     paths.extend([[n] for n in isolated_nodes])
 
@@ -287,7 +358,7 @@ def decompose_paths_linear(CG: nx.DiGraph):
 
 def write_sequences(CG, txt_path, sapi_id_map=None):
     """
-    Sequence output based on linear path cover (replaces exponential DFS).
+    Output sequences by linear path cover (replacing exponential DFS enumeration).
     """
     if CG.number_of_nodes() == 0:
         os.makedirs(os.path.dirname(txt_path), exist_ok=True)
@@ -335,8 +406,8 @@ def compute_txt_path(gexf_path, gexf_root, output_root):
 
 def _is_unclosed_xml_error(exc: Exception) -> bool:
     """
-    Determine if the exception is an XML unclosed token problem.
-    Compatible with both lxml and stdlib ElementTree exception types.
+    Determine if an exception was an XML unclosed token error.
+    Compatible with both lxml and ElementTree exception types.
     """
     msg = str(exc).lower()
     if "unclosed token" in msg:
@@ -351,21 +422,20 @@ def _is_unclosed_xml_error(exc: Exception) -> bool:
 def gexf_to_sequences(gexf_path, gexf_root, output_root, sapi_id_map=None, force=False):
     txt_path = compute_txt_path(gexf_path, gexf_root, output_root)
 
-    # Skip if output file already exists and not forcing regeneration
+    # Skip existing output file unless forced
     if not force and os.path.exists(txt_path):
         print(f"{txt_path}: exists - skip")
         return
 
     try:
-        G = nx.read_gexf(gexf_path)
-        G = relabel_graph_nodes_to_java(G)
+        G = read_gexf_as_java_digraph(gexf_path)
         if sapi_id_map:
             sensitive_set = set(sapi_id_map.keys())
             G = contract_to_sensitive(G, sensitive_set)
         # Output sequences using linear path cover
         write_sequences(G, txt_path, sapi_id_map=sapi_id_map)
     except Exception as e:
-        # Automatically delete GEXF files with unclosed XML
+        # Auto delete "unclosed" GEXF files
         if _is_unclosed_xml_error(e):
             try:
                 os.remove(gexf_path)
@@ -386,7 +456,7 @@ def find_all_gexf_files(root):
 
 
 def main():
-    # Record start time (string and timestamp)
+    # Record start time (string + timestamp)
     start_ts = time.time()
     start_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_ts))
 
@@ -395,14 +465,14 @@ def main():
     output_root = args.output_root
     sapi_id_map = load_sapi_map(args.sapi) if args.sapi else None
 
-    # Ensure output root directory exists (for run_time.log)
+    # Ensure output root directory exists (for later writing run_time.log)
     os.makedirs(output_root, exist_ok=True)
 
     gexf_files = find_all_gexf_files(gexf_root)
     if not gexf_files:
         print("No .gexf files found.")
 
-        # Record run time even if no files
+        # Even if no files, still record run time
         end_ts = time.time()
         end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
         elapsed = end_ts - start_ts
@@ -419,7 +489,7 @@ def main():
             print(f"WARNING: failed to write time log: {e}")
         return
 
-    # Prefilter: remove files that already have results (unless forcing)
+    # Pre-filter: remove files with existing results (unless forcing)
     if not args.force:
         original_count = len(gexf_files)
         gexf_files = [
@@ -432,7 +502,7 @@ def main():
         if not gexf_files:
             print("All sequences already exist; nothing to do.")
 
-            # Also record runtime here
+            # Also record run time here
             end_ts = time.time()
             end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
             elapsed = end_ts - start_ts
@@ -466,7 +536,7 @@ def main():
         ):
             pass
 
-    # End time and cost recording
+    # End time and cost record
     end_ts = time.time()
     end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
     elapsed = end_ts - start_ts
