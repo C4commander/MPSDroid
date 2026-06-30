@@ -1,6 +1,7 @@
 import os
 import argparse
 import networkx as nx
+from collections import defaultdict
 from functools import partial
 from multiprocessing import Pool as ProcessPool
 from math import ceil
@@ -32,11 +33,11 @@ def parse_args():
     )
     p.add_argument(
         '-s', '--sapi',
-        default="/mnt/data2/wb2024/Data/Sensitive_inf/APIChecker_dot.txt",
+        default="/mnt/data2/wb2024/Data/Sensitive_inf/APIChecker_PScout.txt",
         help='Sensitive API list (one per line, already Java method names, e.g., android.telephony.SmsManager.sendTextMessage). Used for contraction and output ID sequences (1-based).'
     )
     p.add_argument(
-        '-w', '--workers', type=int, default=max(1, min((os.cpu_count() or 1), 120)),
+        '-w', '--workers', type=int, default=min((os.cpu_count() or 1), 120),
         help='Number of parallel processes (default: number of CPU cores).'
     )
     p.add_argument(
@@ -72,6 +73,70 @@ def relabel_graph_nodes_to_java(CG: nx.Graph) -> nx.DiGraph:
         mapping[n] = java if java else name
     CG2 = nx.relabel_nodes(CG, mapping, copy=True)
     return nx.DiGraph(CG2)
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _mapped_java_name(node_id: str, node_label: str = "") -> str:
+    raw_id = str(node_id or "").strip()
+    raw_label = str(node_label or "").strip()
+
+    java = dalvik_to_java_method(raw_id)
+    if java:
+        return java
+
+    if raw_label and raw_label != raw_id:
+        java = dalvik_to_java_method(raw_label)
+        if java:
+            return java
+
+    return raw_id or raw_label
+
+
+def read_gexf_as_java_digraph(gexf_path: str):
+    """
+    Stream-parse a GEXF file and directly build the relabelled DiGraph.
+
+    This avoids the expensive path of:
+    1. fully loading the original graph with nx.read_gexf(...)
+    2. copying it again with nx.relabel_nodes(..., copy=True)
+    """
+    graph = nx.DiGraph()
+    id_to_name = {}
+    unresolved_edges = []
+
+    context = ET.iterparse(gexf_path, events=("end",))
+    for _, elem in context:
+        tag = _xml_local_name(elem.tag)
+
+        if tag == "node":
+            node_id = elem.get("id", "")
+            node_label = elem.get("label", "")
+            mapped = _mapped_java_name(node_id, node_label)
+            id_to_name[node_id] = mapped
+            graph.add_node(mapped)
+        elif tag == "edge":
+            source = elem.get("source", "")
+            target = elem.get("target", "")
+            src_name = id_to_name.get(source)
+            dst_name = id_to_name.get(target)
+            if src_name is not None and dst_name is not None:
+                graph.add_edge(src_name, dst_name)
+            else:
+                unresolved_edges.append((source, target))
+
+        elem.clear()
+
+    if unresolved_edges:
+        for source, target in unresolved_edges:
+            src_name = id_to_name.get(source)
+            dst_name = id_to_name.get(target)
+            if src_name is not None and dst_name is not None:
+                graph.add_edge(src_name, dst_name)
+
+    return graph
 
 
 def contract_to_sensitive(CG: nx.DiGraph, sensitive_set: set) -> nx.DiGraph:
@@ -140,12 +205,11 @@ def _kmp_build(pattern):
     return lps
 
 
-def _kmp_contains(text, pattern):
+def _kmp_contains_with_lps(text, pattern, lps):
     if not pattern:
         return True
     if len(pattern) > len(text):
         return False
-    lps = _kmp_build(pattern)
     i = j = 0
     while i < len(text):
         if text[i] == pattern[j]:
@@ -164,16 +228,27 @@ def _kmp_contains(text, pattern):
 def prune_subsequences_tuples(seq_tuples):
     seq_tuples_sorted = sorted(seq_tuples, key=len, reverse=True)
     kept = []
+    kept_by_token = defaultdict(list)
     for cand in seq_tuples_sorted:
         is_sub = False
-        for big in kept:
+        lps = _kmp_build(cand)
+        candidate_indexes = kept_by_token.get(cand[0], []) if cand else range(len(kept))
+        seen_indexes = set()
+        for idx in candidate_indexes:
+            if idx in seen_indexes:
+                continue
+            seen_indexes.add(idx)
+            big = kept[idx]
             if len(big) < len(cand):
                 continue
-            if _kmp_contains(big, cand):
+            if _kmp_contains_with_lps(big, cand, lps):
                 is_sub = True
                 break
         if not is_sub:
+            idx = len(kept)
             kept.append(cand)
+            for token in set(cand):
+                kept_by_token[token].append(idx)
     return kept
 
 
@@ -353,8 +428,7 @@ def gexf_to_sequences(gexf_path, gexf_root, output_root, sapi_id_map=None, force
         return
 
     try:
-        G = nx.read_gexf(gexf_path)
-        G = relabel_graph_nodes_to_java(G)
+        G = read_gexf_as_java_digraph(gexf_path)
         if sapi_id_map:
             sensitive_set = set(sapi_id_map.keys())
             G = contract_to_sensitive(G, sensitive_set)
