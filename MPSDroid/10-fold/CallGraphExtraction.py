@@ -1,372 +1,248 @@
 import argparse
-import gc
-import sys
 import os
 import time
+import traceback
 import zipfile
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
-from xml.sax.saxutils import escape
+from multiprocessing import Pool as ThreadPool
+from pathlib import Path
+
+import networkx as nx
+from androguard.misc import AnalyzeAPK
+
 from loguru import logger
+import sys
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import resource
+except Exception:
+    resource = None
 
 logger.remove()
 logger.add(sys.stderr, level="WARNING")
 
+_MB = 1024.0 * 1024.0
+
+
+def get_rss_mb():
+    if psutil is None:
+        return None
+    try:
+        return psutil.Process(os.getpid()).memory_info().rss / _MB
+    except Exception:
+        return None
+
+
+def get_peak_rss_mb():
+    if resource is None:
+        return None
+    try:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return peak / _MB
+        return peak / 1024.0
+    except Exception:
+        return None
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Extract APK function call graphs as GEXF files.")
-    parser.add_argument(
-        "-f", "--file",
-        help="Input root directory: recursively process all APK files under this directory.",
-        default="/mnt/data2/wb2024/Data/data-md",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        help="Output root directory: generated .gexf files preserve the input directory structure.",
-        default="/mnt/data2/wb2024/Methodology/MyWay/data/Graph-md",
-    )
-    parser.add_argument(
-        "-j", "--workers",
-        type=int,
-        default=max(1, min(os.cpu_count() or 1, 120)),
-        help="Number of worker processes.",
-    )
-    parser.add_argument(
-        "--delete-on-fail",
-        action="store_true",
-        default=False,
-        help="Delete APK files that cannot be parsed or are not valid zip files.",
-    )
-    parser.add_argument(
-        "--max-process",
-        type=int,
-        default=5000,
-        help="Maximum number of APKs to process; 0 means no limit.",
-    )
-    parser.add_argument(
-        "--huge-apk-mb",
-        type=float,
-        default=12.0,
-        help="APKs at or above this size are processed with reduced concurrency to lower peak RAM.",
-    )
-    parser.add_argument(
-        "--large-apk-mb",
-        type=float,
-        default=6.0,
-        help="APKs at or above this size are processed with moderately reduced concurrency.",
-    )
-    parser.add_argument(
-        "--huge-apk-workers",
-        type=int,
-        default=4,
-        help="Worker cap for huge APKs.",
-    )
-    parser.add_argument(
-        "--large-apk-workers",
-        type=int,
-        default=12,
-        help="Worker cap for large APKs.",
-    )
-    return parser.parse_args()
+    parser = argparse.ArgumentParser(description='To obtain the call graphs.')
+    parser.add_argument('-f', '--file', default="/mnt/data2/wb2024/Data/data-md", help='The path of an APK file or a dir contains some APK files', type=str)
+    parser.add_argument('-o', '--output', default="/mnt/data2/wb2024/Methodology/MyWay/data/Graph-md", help='The path of output.', type=str)
+    parser.add_argument('-w', '--workers', help='Number of APKs processed in parallel when input is a directory', type=int, default=120)
+    args = parser.parse_args()
+    return args
 
+def iter_method_analyses(dx):
+    """Iterate over MethodAnalysis objects across older/newer androguard releases."""
+    if hasattr(dx, "get_methods"):
+        return dx.get_methods()
+    return dx.find_methods('.*', '.*', '.*', '.*')
 
-def method_signature(method):
-    return f"{method.get_class_name()}->{method.get_name()}{method.get_descriptor()}"
+def unwrap_method(method_like):
+    """Return the underlying method object for MethodAnalysis / ExternalMethod / EncodedMethod."""
+    if hasattr(method_like, "get_method"):
+        return method_like.get_method()
+    return method_like
 
+def build_method_signature(method_like):
+    method_obj = unwrap_method(method_like)
+    return (
+        method_obj.get_class_name()
+        + '->'
+        + method_obj.get_name()
+        + method_obj.get_descriptor()
+    )
 
-def collect_call_graph_data(dx):
-    node_ids = {}
-    node_names = []
-    edges = set()
+def get_call_graph(dx):
+    CG = nx.DiGraph()
+    for m in iter_method_analyses(dx):
+        api_call = build_method_signature(m)
 
-    def intern_node(name):
-        idx = node_ids.get(name)
-        if idx is None:
-            idx = len(node_names)
-            node_ids[name] = idx
-            node_names.append(name)
-        return idx
-
-    for method_analysis in dx.find_methods(".*", ".*", ".*", ".*"):
-        xrefs = method_analysis.get_xref_to()
-        if not xrefs:
+        xrefs = list(m.get_xref_to())
+        if len(xrefs) == 0:
             continue
+        CG.add_node(api_call)
 
-        caller = method_signature(method_analysis.get_method())
-        caller_idx = intern_node(caller)
+        for _, callee, _ in xrefs:
+            _callee = build_method_signature(callee)
+            CG.add_node(_callee)
+            if not CG.has_edge(api_call, _callee):
+                CG.add_edge(api_call, _callee)
 
-        for _other_class, callee, _offset in xrefs:
-            callee_sig = method_signature(callee.method)
-            callee_idx = intern_node(callee_sig)
-            edges.add((caller_idx, callee_idx))
-    return node_names, edges
+    return CG
 
+def resolve_output_gexf(apk_path: Path, output_root: Path, input_root: Path | None):
+    if input_root is not None:
+        relative_apk = apk_path.relative_to(input_root)
+        return output_root / relative_apk.with_suffix('.gexf')
+    return output_root / f"{apk_path.stem}.gexf"
 
-def write_gexf_fast(node_names, edges, output_path):
-    with open(output_path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        handle.write('<gexf xmlns="http://www.gexf.net/1.2draft" version="1.2">\n')
-        handle.write('  <graph mode="static" defaultedgetype="directed">\n')
-        handle.write('    <nodes>\n')
-        for node_name in node_names:
-            escaped = escape(node_name, {'"': "&quot;"})
-            handle.write(f'      <node id="{escaped}" label="{escaped}" />\n')
-        handle.write('    </nodes>\n')
-        handle.write('    <edges>\n')
-        for edge_id, (src_idx, dst_idx) in enumerate(edges):
-            src = escape(node_names[src_idx], {'"': "&quot;"})
-            dst = escape(node_names[dst_idx], {'"': "&quot;"})
-            handle.write(f'      <edge id="{edge_id}" source="{src}" target="{dst}" />\n')
-        handle.write('    </edges>\n')
-        handle.write('  </graph>\n')
-        handle.write('</gexf>\n')
+def apk_to_callgraph(app_path, output_root, input_root=None):
+    started_at = time.time()
+    apk_path = Path(app_path)
+    apk_name = apk_path.stem
+    output_root = Path(output_root)
+    input_root_path = Path(input_root) if input_root is not None else None
+    file_cg = resolve_output_gexf(apk_path, output_root, input_root_path)
 
-
-def normalize_root(path):
-    return path[:-1] if path.endswith(("/", "\\")) else path
-
-
-def derive_output_dir(app_path, input_root, out_root):
-    rel_dir = os.path.relpath(os.path.dirname(app_path), input_root)
-    if rel_dir == "." or rel_dir == os.curdir:
-        return out_root
-    return os.path.join(out_root, rel_dir)
-
-
-def compute_gexf_path(app_path, input_root, out_root, create_parent=False):
-    apk_name = os.path.splitext(os.path.basename(app_path))[0]
-    target_dir = derive_output_dir(app_path, input_root, out_root)
-    if create_parent:
-        os.makedirs(target_dir, exist_ok=True)
-    return os.path.join(target_dir, apk_name + ".gexf")
-
-
-def collect_apks(root_dir):
-    apks = []
-    for dirpath, _dirnames, filenames in os.walk(root_dir):
-        for fn in filenames:
-            if fn.lower().endswith(".apk"):
-                apks.append(os.path.join(dirpath, fn))
-    return sorted(apks)
-
-
-def sort_apks_for_balanced_scheduling(apk_paths):
-    def sort_key(path):
-        try:
-            return os.path.getsize(path)
-        except OSError:
-            return -1
-
-    return sorted(apk_paths, key=sort_key, reverse=True)
-
-
-def split_tasks_by_size(tasks, large_apk_mb, huge_apk_mb):
-    huge = []
-    large = []
-    normal = []
-    for apk_path in tasks:
-        try:
-            size_mb = os.path.getsize(apk_path) / (1024.0 * 1024.0)
-        except OSError:
-            size_mb = 0.0
-        if size_mb >= huge_apk_mb:
-            huge.append(apk_path)
-        elif size_mb >= large_apk_mb:
-            large.append(apk_path)
-        else:
-            normal.append(apk_path)
-    return huge, large, normal
-
-
-def maybe_delete(path, enabled, ok_msg, fail_msg):
-    if not enabled:
-        return ok_msg
-    try:
-        os.remove(path)
-        return ok_msg.replace("SKIP", "NOTZIP_DELETED").replace("FAIL", "FAIL_DELETED")
-    except Exception as exc:
-        return f"{fail_msg} | delete_err={exc}"
-
-
-def apk_to_callgraph(app_path, input_root, out_root, delete_on_fail=False):
-    apk_name = os.path.splitext(os.path.basename(app_path))[0]
-    start_ts = time.time()
-    analysis = None
-    node_names = None
-    edges = None
-
+    if file_cg.exists():
+        return {"apk": str(apk_path), "status": "skipped_existing", "elapsed": 0.0, "output": str(file_cg)}
     if not zipfile.is_zipfile(app_path):
-        msg = maybe_delete(
-            app_path,
-            delete_on_fail,
-            f"SKIP (not zip): {apk_name}",
-            f"NOTZIP_DELETE_ERROR: {apk_name}",
-        )
-        return msg, time.time() - start_ts
-
-    file_cg = compute_gexf_path(app_path, input_root, out_root, create_parent=True)
-    if os.path.exists(file_cg):
-        return f"EXIST: {apk_name}", time.time() - start_ts
+        return {"apk": str(apk_path), "status": "skipped_invalid_zip", "elapsed": 0.0}
 
     try:
-        from androguard.misc import AnalyzeAPK
+        # AnalyzeAPK remains the supported high-level entrypoint in current androguard
+        # releases, while dx exposes modern Analysis / MethodAnalysis accessors.
+        _, _, dx = AnalyzeAPK(str(apk_path))
+        rss_start_mb = get_rss_mb()
+        graph_started_at = time.time()
+        cg = get_call_graph(dx=dx)
+        graph_elapsed = time.time() - graph_started_at
+        rss_end_mb = get_rss_mb()
 
-        _apk, _dex, analysis = AnalyzeAPK(app_path)
-        node_names, edges = collect_call_graph_data(analysis)
-        write_gexf_fast(node_names, edges, file_cg)
-        msg = f"DONE: {apk_name}"
+        file_cg.parent.mkdir(parents=True, exist_ok=True)
+        nx.write_gexf(cg, file_cg)
+
+        elapsed = graph_elapsed
+        return {
+            "apk": str(apk_path),
+            "status": "ok",
+            "elapsed": elapsed,
+            "nodes": cg.number_of_nodes(),
+            "edges": cg.number_of_edges(),
+            "output": str(file_cg),
+            "rss_start_mb": rss_start_mb,
+            "rss_end_mb": rss_end_mb,
+            "rss_delta_mb": None if rss_start_mb is None or rss_end_mb is None else rss_end_mb - rss_start_mb,
+            "peak_rss_mb": get_peak_rss_mb(),
+            "total_elapsed": time.time() - started_at,
+        }
     except Exception as exc:
-        msg = maybe_delete(
-            app_path,
-            delete_on_fail,
-            f"FAIL: {apk_name} -> {exc}",
-            f"FAIL_DELETE_ERROR: {apk_name} -> {exc}",
-        )
-    finally:
-        del analysis, node_names, edges
-        gc.collect()
+        elapsed = time.time() - started_at
+        rss_start_mb = get_rss_mb()
+        rss_end_mb = get_rss_mb()
+        return {
+            "apk": str(apk_path),
+            "status": "error",
+            "elapsed": elapsed,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+            "rss_start_mb": rss_start_mb,
+            "rss_end_mb": rss_end_mb,
+            "rss_delta_mb": None if rss_start_mb is None or rss_end_mb is None else rss_end_mb - rss_start_mb,
+            "peak_rss_mb": get_peak_rss_mb(),
+            "total_elapsed": elapsed,
+        }
 
-    return msg, time.time() - start_ts
+def _apk_worker(args):
+    return apk_to_callgraph(*args)
 
+def log_result(result, processed_count, processed_elapsed, total_count):
+    apk_name = result["apk"]
+    status = result["status"]
+    elapsed = result["elapsed"]
+    progress = f"[{processed_count}/{total_count}]"
 
-def process_batches(tasks, input_root, out_root, args):
-    total_apk_time = 0.0
-    processed_count = 0
-    worker_fn = partial(
-        apk_to_callgraph,
-        input_root=input_root,
-        out_root=out_root,
-        delete_on_fail=args.delete_on_fail,
-    )
-
-    huge_tasks, large_tasks, normal_tasks = split_tasks_by_size(
-        tasks,
-        large_apk_mb=args.large_apk_mb,
-        huge_apk_mb=args.huge_apk_mb,
-    )
-    batches = [
-        ("huge", huge_tasks, max(1, min(args.workers, args.huge_apk_workers))),
-        ("large", large_tasks, max(1, min(args.workers, args.large_apk_workers))),
-        ("normal", normal_tasks, max(1, args.workers)),
-    ]
-
-    for batch_name, batch_tasks, batch_workers in batches:
-        if not batch_tasks:
-            continue
+    if status == "ok":
+        avg = processed_elapsed / processed_count if processed_count else 0.0
         print(
-            f"Starting {batch_name} APK batch: count={len(batch_tasks)} | workers={batch_workers}",
-            flush=True,
+            f"{progress} [OK] {apk_name} | elapsed={elapsed:.4f}s | avg={avg:.4f}s/apk | "
+            f"nodes={result.get('nodes', 0)} | edges={result.get('edges', 0)}"
         )
-        with ProcessPoolExecutor(max_workers=batch_workers) as executor:
-            for msg, dur in executor.map(worker_fn, batch_tasks, chunksize=1):
-                if msg:
-                    print(msg)
-                total_apk_time += dur
-                processed_count += 1
-    return total_apk_time, processed_count
-
+    elif status == "error":
+        avg = processed_elapsed / processed_count if processed_count else 0.0
+        print(f"{progress} [ERROR] {apk_name} | elapsed={elapsed:.4f}s | avg={avg:.4f}s/apk | {result['error']}")
+        print(result["traceback"])
+    else:
+        print(f"{progress} [SKIP] {apk_name} | reason={status}")
 
 def main():
-    try:
-        import multiprocessing as mp
-        if mp.get_start_method(allow_none=True) is None:
-            mp.set_start_method("spawn", force=False)
-    except Exception:
-        pass
-
-    start_ts = time.time()
-    start_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_ts))
-
+    tic = time.time()
     args = parse_args()
-    out_root = normalize_root(args.output)
-    os.makedirs(out_root, exist_ok=True)
 
-    input_path = args.file
-    delete_on_fail = args.delete_on_fail
-    max_process = args.max_process
-    total_apk_time = 0.0
-    processed_count = 0
+    os.makedirs(args.output, exist_ok=True)
+    out_path = Path(args.output)
 
-    if os.path.isdir(input_path):
-        input_root = normalize_root(input_path)
-        apks = collect_apks(input_root)
+    if os.path.isdir(args.file):
+        input_root = Path(args.file).resolve()
+        apks = sorted(path for path in input_root.rglob('*') if path.is_file() and path.suffix.lower() == '.apk')
+        total_count = len(apks)
+        pool = ThreadPool(args.workers)
+        processed_count = 0
+        processed_elapsed = 0.0
+        total_memory_mb = 0.0
+        memory_count = 0
+        ok_count = 0
+        error_count = 0
+        skip_count = 0
+        finished_count = 0
 
-        if not apks:
-            print(f"No APK files found under: {input_root}")
-        else:
-            skipped_existing = 0
-            to_process = []
-            for apk in apks:
-                gexf_path = compute_gexf_path(apk, input_root, out_root, create_parent=False)
-                if os.path.exists(gexf_path):
-                    skipped_existing += 1
-                else:
-                    to_process.append(apk)
-
-            to_process = sort_apks_for_balanced_scheduling(to_process)
-            original_need = len(to_process)
-            if max_process > 0 and original_need > max_process:
-                to_process = to_process[:max_process]
-
-            print(
-                f"Total APKs: {len(apks)} | Already have .gexf: {skipped_existing} | "
-                f"Need (before limit): {original_need} | Will process (after limit): {len(to_process)} | "
-                f"Limit (--max-process)={max_process} | Workers={args.workers} | Delete-on-fail={delete_on_fail}"
-            )
-
-            if to_process:
-                total_apk_time, processed_count = process_batches(to_process, input_root, out_root, args)
+        for result in pool.imap_unordered(
+            _apk_worker,
+            [(str(apk), str(out_path), str(input_root)) for apk in apks],
+        ):
+            finished_count += 1
+            if result["status"] == "ok":
+                processed_count += 1
+                processed_elapsed += result["elapsed"]
+                ok_count += 1
+            elif result["status"] == "error":
+                processed_count += 1
+                processed_elapsed += result["elapsed"]
+                error_count += 1
             else:
-                print("Nothing to do. All needed .gexf already exist or limit is 0.")
+                skip_count += 1
+            if result.get("rss_end_mb") is not None:
+                total_memory_mb += result["rss_end_mb"]
+                memory_count += 1
+            log_result(result, finished_count, processed_elapsed, total_count)
+
+        pool.close()
+        pool.join()
     else:
-        input_root = os.path.dirname(os.path.abspath(input_path)) or "."
-        gexf_path = compute_gexf_path(input_path, input_root, out_root, create_parent=False)
-        if os.path.exists(gexf_path):
-            print(f"EXIST: {os.path.splitext(os.path.basename(input_path))[0]}")
-        else:
-            os.makedirs(os.path.dirname(gexf_path), exist_ok=True)
-            msg, dur = apk_to_callgraph(
-                input_path,
-                input_root,
-                out_root,
-                delete_on_fail=delete_on_fail,
-            )
-            if msg:
-                print(msg)
-            total_apk_time += dur
-            processed_count += 1
+        result = apk_to_callgraph(args.file, out_path)
+        total_count = 1
+        processed_count = 1 if result["status"] in {"ok", "error"} else 0
+        processed_elapsed = result["elapsed"] if processed_count else 0.0
+        total_memory_mb = result["rss_end_mb"] if result.get("rss_end_mb") is not None else 0.0
+        memory_count = 1 if result.get("rss_end_mb") is not None else 0
+        log_result(result, 1, processed_elapsed, total_count)
+        ok_count = 1 if result["status"] == "ok" else 0
+        error_count = 1 if result["status"] == "error" else 0
+        skip_count = 1 if result["status"].startswith("skipped_") else 0
 
-    end_ts = time.time()
-    end_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_ts))
-    elapsed = end_ts - start_ts
+    total_elapsed = time.time() - tic
+    avg_elapsed = processed_elapsed / processed_count if processed_count else 0.0
+    avg_memory_mb = total_memory_mb / memory_count if memory_count else 0.0
+    print(
+        f"[SUMMARY] total_elapsed={total_elapsed:.4f}s | processed={processed_count} | "
+        f"ok={ok_count} | error={error_count} | skipped={skip_count} | "
+        f"avg_call_graph={avg_elapsed:.4f}s/apk | avg_memory={avg_memory_mb:.4f}MB"
+    )
 
-    print(f"Total elapsed: {elapsed:.2f}s")
-
-    if processed_count > 0:
-        avg_per_apk = total_apk_time / processed_count
-        print(
-            f"Processed APKs: {processed_count} | "
-            f"Total APK compute time: {total_apk_time:.2f}s | "
-            f"Average per APK: {avg_per_apk:.2f}s"
-        )
-    else:
-        avg_per_apk = 0.0
-        print("Processed APKs: 0")
-
-    log_path = os.path.join(out_root, "run_time.log")
-    try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"Start: {start_str} | End: {end_str} | "
-                f"TotalElapsed: {elapsed:.2f}s | "
-                f"ProcessedAPKs: {processed_count} | "
-                f"TotalAPKTime: {total_apk_time:.2f}s | "
-                f"AvgPerAPK: {avg_per_apk:.2f}s | "
-                f"Input: {input_path}\n"
-            )
-    except Exception as exc:
-        print(f"WARNING: failed to write time log: {exc}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
